@@ -8,12 +8,13 @@
 
 ```mermaid
 flowchart TB
-    WEB["Web\nбраузер или локальный Cog/WPE"]
-    TUI["TUI\nRust + ratatui, локально/SSH"]
+    WEB["**Web браузер**<br> или локальный Cog/WPE"]
+    TUI["**TUI**<br>Go + bubbletea, локально/SSH"]
+    REMOTE["**Remote HW**"]
 
-    CADDY["Caddy\nстатика Web-сборки + reverse proxy /api/*"]
+    CADDY["**Caddy**<br>статика Web-сборки + reverse proxy /api/*"]
 
-    subgraph CORE["flipctld — backend-ядро (Go)"]
+    subgraph CORE["**flipctld** — backend-ядро (Go)"]
         API["HTTP + SSE API"]
         REG["Plugin Registry"]
         JM["Job Manager"]
@@ -30,8 +31,9 @@ flowchart TB
         BIN["CLI-утилиты"]
     end
 
-    WEB -- "HTTP/SSE" --> CADDY -- "/api/*" --> API
-    TUI -- "HTTP/SSE, напрямую" --> API
+    WEB --> CADDY -- "HTTP/SSE" --> API
+    REMOTE -- "SSH" --> TUI
+    TUI -- "HTTP/SSE" --> API
     API --> REG
     API --> JM
     JM -- "spawn + NDJSON/stdio" --> PLUGINS
@@ -45,7 +47,7 @@ flowchart TB
 ## Frontend
 
 - **Web** — React + `react-dom`, рендер в один `<canvas>` (`PixelSurface`/`CanvasSurface`) ради pixel-perfect 1-bit стиля прототипа `fake-flipctl2`. Без Yoga — фиксированные пиксельные константы, как в оригинале.
-- **TUI** — Rust + `ratatui` + `crossterm`. Не pixel-perfect, обычный текстовый UI. Без Node/JS-рантайма — экономия ресурсов на RPi4. SSH — через forced-command системного `sshd`.
+- **TUI** — Go + `bubbletea`/`lipgloss`/`bubbles`. Тот же язык, что backend — реальная синергия общих типов (`contract/go/apitypes`), не задокументированный на будущее план. Не pixel-perfect, обычный текстовый UI. Компилируемый бинарник, экономия ресурсов на RPi4. SSH — через forced-command системного `sshd` (или `wish` в будущем).
 - Общее между Web и TUI:
   - семантика ввода (`InputAction`: Up/Down/Ok/Back/Ptt/...);
   - модель навигации (стек экранов + отдельный overlay-стек);
@@ -92,11 +94,11 @@ flowchart TB
 - `openapi.yaml` — HTTP/SSE API (`/api/registry`, `/api/plugins/{id}/{action}`, `/api/jobs/*`).
 - `manifest.schema.json` — JSON Schema манифеста плагина.
 - `ipc-messages.schema.json` — схема NDJSON-сообщений `flipctld` ↔ плагин.
-- Формализовано, чтобы риск ручной рассинхронизации типов между Go/Rust/TS закрывался кодогенерацией по требованию, а не постоянной ручной работой.
+- Формализовано, чтобы риск ручной рассинхронизации типов закрывался кодогенерацией: backend и TUI (оба на Go) используют один сгенерированный пакет `contract/go/apitypes` напрямую, Web (TypeScript) — отдельно генерирует TS-типы из той же схемы.
 
 ## Принятые trade-off'ы (не забыть)
 
-- Backend = **Go**, TUI = **Rust** — разные языки, синергия общих типов не достигается автоматически; принято как есть, при реальной боли — языконезависимая схема (уже есть) решает вопрос без пересмотра стеков.
+- Backend = **Go**, TUI изначально была **Rust** — синергия типов не достигалась автоматически, это было принято как есть. Пересмотрено: TUI переписана на **Go** (`bubbletea`) специально ради синергии — теперь backend и TUI используют общий сгенерированный пакет типов напрямую.
 - Sandboxing плагинов — отложен, дыра осознана и задокументирована, не забыта.
 - Слот-панель софт-кнопок как формальный UI Kit примитив — в бэклоге.
 - Caddy как отдельный процесс (вариант B) выбран сознательно ради низкого порога входа и независимого релиза Web-фронтенда — цена: второй резидентный процесс на RPi4. Путь назад к раздаче статики самим `flipctld` (вариант C) — дешёвая миграция, не переделка архитектуры.
