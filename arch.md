@@ -57,14 +57,16 @@ flowchart TB
   - семантика ввода (`InputAction`: Up/Down/Ok/Back/SoftKey1/...);
   - модель навигации (стек экранов + отдельный overlay-стек);
   - реестр приложений — приходит из backend registry manager, не хранится во frontend.
-- Типичный вызов плагина `GET /api/registry` в рантайме:
+- Пример **одного элемента** массива, который отдаёт `GET /api/registry` — так backend описывает фронтенду один конкретный плагин (`ping`); реестр целиком — это массив таких объектов, по одному на каждый установленный плагин:
   ```jsonc
   { "id": "ping", "kind": "generic",
     "inputs": [{ "id": "target", "type": "text" }],
     "actions": [{ "id": "run", "endpoint": "/api/plugins/ping/run", "bind": "slot:2" }] }
   ```
-  - `kind: "custom"` → написанный вручную экран (Wi-Fi, Ethernet, Power).
-  - `kind: "generic"` → один общий компонент (`GenericActionScreen`/`generic_action.go`) для простых CLI-wrapper плагинов, без platform-специфичного кода на каждый новый плагин.
+  - `id` — уникальный идентификатор плагина; из него строятся все остальные пути (`/api/plugins/ping/...`).
+  - `kind: "generic"` — фронтенду не нужно искать написанный вручную экран, плагин рисуется общим компонентом `GenericActionScreen.tsx`/`generic_action.go`. Для сравнения: `kind: "custom"` → написанный вручную экран (Wi-Fi, Ethernet, Power) со своей логикой.
+  - `inputs` — поля, которые пользователь заполняет перед запуском. Здесь одно текстовое поле `target` — на экране появится строка ввода; то, что туда впишут, уйдёт в плагин под тем же ключом `target` (см. IPC-пример ниже — это один и тот же `ping`, просто на следующем шаге).
+  - `actions` — софт-кнопки экрана.
 
 ## Backend
 
@@ -82,20 +84,26 @@ flowchart TB
     - `custom` — собственный уникальный UI, который представлен настоящими ассетами в `frontend/UI`.
     - `generic` — использует примитивы из дефолтового UI-kit: list, grid, MenuBar, softKeys, dropDown, ...
 
-- **IPC** — NDJSON поверх stdin/stdout:
+- **IPC** — отдельный протокол между `flipctld` и конкретным запущенным процессом плагина; инициализируется сразу после того, как пользователь нажал кнопку из примера выше. NDJSON = по одному JSON-объекту на строку — самый простой формат, не требует библиотек ни на одном языке:
   ```json
   {"type":"start","inputs":{"target":"8.8.8.8"}}
   {"type":"output","fields":{"status":"reachable","rtt_ms":13.2}}
   {"type":"done","exit_code":0}
   ```
-- **Job / Session / Event Bus** — job общий для всех клиентов с самого начала: кто угодно может подписаться на уже бегущий job через SSE (Web и TUI видят один и тот же живой поток одновременно).
+  - Строка 2 — плагин пишет в свой **stdout**: вызвал системный `ping`, распарсил его вывод сам и отдал уже структурированный результат (`status`, `rtt_ms` — поля, объявленные в манифесте плагина как `outputs`). `flipctld` принимает эту строку и рассылает её всем клиентам, подписанным на этот job, через SSE — в том числе тем, кто job не запускал.
+
+- **Job / Session / Event Bus** — job общий для всех клиентов с самого начала: кто угодно может подписаться на уже бегущий job через SSE (Web и TUI видят один и тот же живой поток одновременно). Состояний больше, чем "работает/не работает" — важно различать, на каком именно этапе всё пошло не так:
 
   ```mermaid
   stateDiagram-v2
-      [*] --> Running: spawn OK
-      Running --> Completed: done
-      Running --> Stopped: stop_job
+      [*] --> Pending: POST /api/plugins/{id}/{action}
+      Pending --> Running: процесс заспавнен, получено "ready"
+      Pending --> Failed: не удалось запустить процесс
+      Running --> Completed: "done", exit_code=0
+      Running --> Failed: "error" или exit_code != 0
+      Running --> Stopped: stop_job (SIGTERM)
       Completed --> [*]
+      Failed --> [*]
       Stopped --> [*]
   ```
 
