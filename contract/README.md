@@ -1,40 +1,40 @@
 # FlipCTL Contract
 
-Формальные, машинно-читаемые артефакты, дополняющие прозу [`../frontend.md`](../frontend.md) и [`../backend.md`](../backend.md). Прежде эти документы описывали контракт словами и иллюстративными JSON-примерами; здесь — то же самое как реальные схемы, которые можно валидировать и из которых можно генерировать типы.
+Formal, machine-readable artifacts that complement the prose in [`../frontend.md`](../frontend.md) and [`../backend.md`](../backend.md). Those documents used to describe the contract in words and illustrative JSON examples; here it's the same thing as real schemas that can be validated and used to generate types.
 
-Статус: черновик PoC-стадии (`0.1.0`), не финальная версия — см. открытые вопросы ниже и в `backend.md §12`/`frontend.md §11`.
+Status: PoC-stage draft (`0.1.0`), not final — see the open questions below and in `backend.md §12`/`frontend.md §11`.
 
-## Файлы
+## Files
 
-| Файл | Что описывает | Источник истины в прозе |
+| File | What it describes | Source of truth in prose |
 |---|---|---|
-| `openapi.yaml` | HTTP/SSE API между `flipctld` и Web/TUI фронтендами | `backend.md §7`, `frontend.md §4.2-4.3` |
-| `manifest.schema.json` | `manifest.toml` плагина (валидируется по его TOML→JSON представлению) | `backend.md §4.1-4.4` |
-| `ipc-messages.schema.json` | NDJSON-сообщения между `flipctld` и процессом плагина (stdin/stdout) | `backend.md §5` |
+| `openapi.yaml` | HTTP/SSE API between `flipctld` and the Web/TUI frontends | `backend.md §7`, `frontend.md §4.2-4.3` |
+| `manifest.schema.json` | A plugin's `manifest.toml` (validated against its TOML→JSON representation) | `backend.md §4.1-4.4` |
+| `ipc-messages.schema.json` | NDJSON messages between `flipctld` and a plugin process (stdin/stdout) | `backend.md §5` |
 
-`GET /api/registry` в `openapi.yaml` (схема `RegistryEntry`) и `manifest.schema.json` — не один и тот же файл specifically намеренно: первый — то, что видит frontend (UI-проекция), второй — то, что пишет автор плагина (полное описание, включая биндинги кнопок и permissions). Поля `inputs`/`outputs`↔`status_fields` в них семантически связаны, но это два разных контракта на двух разных границах системы.
+`GET /api/registry` in `openapi.yaml` (the `RegistryEntry` schema) and `manifest.schema.json` are intentionally not the same file: the former is what the frontend sees (a UI projection), the latter is what a plugin author writes (a full description, including button bindings and permissions). The `inputs`/`outputs`↔`status_fields` fields are semantically linked between them, but these are two different contracts at two different boundaries of the system.
 
-## Как этим пользоваться
+## How to use this
 
-- **Валидация манифеста при discovery** (`backend.md §8`): прогонять распарсенный TOML через `manifest.schema.json` любым JSON Schema draft 2020-12 валидатором для Go — например `github.com/santhosh-tekuri/jsonschema`. Манифест с ошибкой валидации — логируется и пропускается (не блокирует остальные плагины), как уже описано в `backend.md §8`.
-- **Кодогенерация типов**:
-  - Go (`flipctld` и TUI, `frontend.md §6`/`backend.md §11.1`): **один** прогон `oapi-codegen` из `openapi.yaml` → пакет `contract/go/apitypes`, который оба Go-бинарника импортируют напрямую. Не два независимых генератора для двух Go-проектов — один пакет, общий для обоих.
-  - TypeScript (Web, `frontend.md §5`): `openapi-typescript` из `openapi.yaml`, отдельно — Web неизбежно другой язык, тут кодогенерация остаётся мостом, а не общим пакетом.
-  - Для `ipc-messages.schema.json` (потребляется только внутри плагинов и `flipctld`, не фронтендами) — `quicktype` умеет генерировать типы под большинство языков плагинов из одной JSON Schema, если понадобится; для плагинов на Go — тот же `oapi-codegen`/ручные структуры, по вкусу автора плагина.
-- Исторически этот раздел описывал план на случай, если TUI останется на Rust (сравнение Go/Rust/TS кодогенераторов раздельно) — TUI переписан на Go специально ради того, чтобы для пары backend↔TUI не нужен был даже кодогенератор per-language, только один общий пакет.
+- **Manifest validation at discovery time** (`backend.md §8`): run the parsed TOML through `manifest.schema.json` with any JSON Schema draft 2020-12 validator for Go — e.g. `github.com/santhosh-tekuri/jsonschema`. A manifest that fails validation is logged and skipped (it doesn't block the other plugins), as already described in `backend.md §8`.
+- **Type codegen**:
+  - Go (`flipctld` and the TUI, `frontend.md §6`/`backend.md §11.1`): **one** `oapi-codegen` run against `openapi.yaml` → the `contract/go/apitypes` package, imported directly by both Go binaries. Not two independent generators for two Go projects — one shared package.
+  - TypeScript (Web, `frontend.md §5`): `openapi-typescript` against `openapi.yaml`, run separately — Web is inevitably a different language, so codegen stays a bridge here rather than a shared package.
+  - For `ipc-messages.schema.json` (consumed only inside plugins and `flipctld`, not by the frontends) — `quicktype` can generate types for most plugin languages from a single JSON Schema if needed; for plugins written in Go, the same `oapi-codegen`/hand-written structs, to the plugin author's taste.
+- This section used to describe a fallback plan for the case where the TUI stayed on Rust (separately comparing Go/Rust/TS codegen) — the TUI has since been rewritten in Go specifically so that the backend↔TUI pair doesn't need a per-language codegen step at all, just one shared package.
 
-## Осознанные упрощения (default-решения, а не согласованные требования)
+## Conscious simplifications (default choices, not agreed requirements)
 
-При формализации пришлось принять несколько технических решений, которых не было в прозе — они низкорисковые и обратимые, но стоит явно знать, что они существуют:
+Formalizing the contract required a few technical calls that weren't in the prose before — they're low-risk and reversible, but worth knowing they exist:
 
-- **OpenAPI 3.1**, не 3.0 — совместим по JSON Schema с `manifest.schema.json`/`ipc-messages.schema.json` (одна и та же схема-грамматика), но чуть хуже поддержан старыми версиями Swagger UI/кодогенераторов — проверить совместимость с конкретными инструментами при реализации.
-- **Единый конверт ошибок** `{"error": {"code", "message"}}` для всех нестандартных ответов API — нигде раньше не была зафиксирована.
-- **SSE не описывается типизированно в OpenAPI** (спецификация этого не умеет) — `GET /api/jobs/{jobId}/events` в `openapi.yaml` даёт только `text/event-stream`, а авторитетная форма payload'а — в `ipc-messages.schema.json`. Если понадобится честная типизация SSE-эндпоинтов, следующий шаг — AsyncAPI поверх тех же `$defs`.
-- **`select`-инпуты со статичным списком `options`** — динамические опции (например, "список Wi-Fi интерфейсов, полученный живым запросом") упомянуты как будущее расширение в `backend.md §4.1`, но не специфицированы здесь.
-- Версии всех трёх файлов синхронизированы с `info.version: 0.1.0` в `openapi.yaml` вручную — авто-синхронизации версий между файлами нет.
+- **OpenAPI 3.1**, not 3.0 — JSON-Schema-compatible with `manifest.schema.json`/`ipc-messages.schema.json` (same schema grammar), but slightly less supported by older Swagger UI/codegen tool versions — check compatibility with specific tools during implementation.
+- **A single error envelope** `{"error": {"code", "message"}}` for all non-2xx API responses — this was never fixed anywhere before.
+- **SSE isn't typed in OpenAPI** (the spec can't express it) — `GET /api/jobs/{jobId}/events` in `openapi.yaml` only declares `text/event-stream`; the authoritative payload shape lives in `ipc-messages.schema.json`. If honest typing of SSE endpoints is ever needed, the next step is AsyncAPI on top of the same `$defs`.
+- **`select` inputs with a static `options` list** — dynamic options (e.g. "a live-queried list of Wi-Fi interfaces") are mentioned as a future extension in `backend.md §4.1`, but not specified here.
+- The versions of all three files are synced with `info.version: 0.1.0` in `openapi.yaml` by hand — there's no automatic version sync across files.
 
-## Что осталось нерешённым (не в этой формализации)
+## What's still unresolved (not covered by this formalization)
 
-- Slot-панель софт-кнопок как отдельный примитив UI Kit (`backend.md §11`, в бэклоге по решению из разговора).
-- Механизм идентификации Session (`backend.md §6`) — обе схемы выше не описывают, как клиент предъявляет `connection_id`.
-- Формальная схема ответа `GET /api/plugins/{id}/status` — сегодня описана как "зеркалит `outputs[]` манифеста" (`additionalProperties: true` в `openapi.yaml`), без строгой типизации per-plugin.
+- The soft-button slot panel as a standalone UI Kit primitive (`backend.md §11`, backlogged per the discussion).
+- The Session identification mechanism (`backend.md §6`) — neither schema above describes how a client presents its `connection_id`.
+- A formal schema for the `GET /api/plugins/{id}/status` response — currently described as "mirrors the manifest's `outputs[]`" (`additionalProperties: true` in `openapi.yaml`), without per-plugin strict typing.

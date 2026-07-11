@@ -1,56 +1,92 @@
-# FlipCTL — архитектура UI и Renderer-слоя (предложение)
+# FlipCTL — UI and Renderer Layer Architecture (proposal)
 
-> Область документа: только **UI Frontend** и **Renderer** из общей схемы FlipCTL (см. `README.md`). Backend спроектирован отдельно, в компаньон-документе [`backend.md`](./backend.md) — здесь важен только API-контракт, который он обязан предоставлять (в частности `GET /api/registry`, раздел 4.2), а не его внутреннее устройство. Целевые платформы PoC — **Web** и **TUI** (SSH/локальный терминал), с прицелом на будущий hardware/DRM-рендерер. Устройство — встраиваемый Linux-хост класса Raspberry Pi 4: ограниченная память, важна экономия CPU/батареи, лишние резидентные рантаймы — это реальная цена, а не абстрактный риск.
+> Scope of this document: only the **UI Frontend** and **Renderer** from FlipCTL's overall design (see `README.md`). The backend is designed separately, in the companion document [`backend.md`](./backend.md) — here only the API contract it must provide matters (in particular `GET /api/registry`, section 4.2), not its internals. Target platforms for the PoC — **Web** and **TUI** (SSH/local terminal), with an eye toward a future hardware/DRM renderer. The device is an embedded Linux host in the SBC class: limited memory, CPU/battery savings matter, extra resident runtimes are a real cost, not an abstract risk.
 
----
-
-## 1. Постановка задачи и ограничения
-
-Из `README.md`:
-
-- UI сейчас — HTML/JS, рендерится headless WebKit (Cog) прямо на DRM, без Xorg/Wayland.
-- Хотим несколько renderer-ов для одного UI: минимум Web и TUI, с прицелом на hardware-таргет в будущем.
-- Web должен быть pixel-perfect: 1-bit/grayscale стиль экрана 256×144 (см. `fake-flipctl2`), кастомные bitmap-шрифты, спрайты.
-- **TUI pixel-perfect не требуется.** Это не "тот же экран в текстовом виде", а полноценный текстовый интерфейс с собственной эстетикой терминала. Web и TUI должны быть узнаваемо одной и той же навигацией/структурой, но не обязаны совпадать визуально.
-- Устройство — встраиваемое, с ограниченными ресурсами и вниманием к энергопотреблению. Лишний резидентный рантайм (JS-движок, WASM-runtime) на TUI-стороне — не бесплатная абстракция, а реальная статья расхода RAM/CPU/батареи, особенно если TUI поднимается интерактивно (SSH-сессия, локальный терминал).
-
-Это прямо определяет ключевое архитектурное решение документа (раздел 2): отказ от идеи "одно React-дерево на оба таргета" в пользу двух независимых, платформенно-идиоматичных реализаций, связанных общим *контрактом*, а не общим *рантаймом*.
-
----
-
-## 2. Ключевое решение: общий контракт, а не общее дерево компонентов
-
-### 2.1 Рассмотренная и отклонённая альтернатива
-
-Первая версия этого документа предлагала паттерн React Native/Ink/Dioxus: одно React-дерево, два React-reconciler-а (`react-dom` для Web, `@opentui/react` для TUI), общий Yoga-layout для согласования координат. У подхода есть зрелые прецеденты (React Native + react-native-web, Ink, Dioxus с TUI-рендерером через ratatui) — и он остаётся валидным выбором для проектов, где TUI тоже должен быть pixel-perfect или где на TUI-стороне уже гарантированно есть Node/Bun.
-
-Причина отказа для FlipCTL конкретно:
-
-1. TUI не обязан быть pixel-perfect → пропадает главный аргумент "рисовать оба через общий низкоуровневый canvas/cell-buffer API".
-2. Требование к экономии ресурсов на встраиваемом устройстве делает Node/Bun/OpenTUI+Yoga(WASM) на TUI-стороне неоправданной ценой ради код-шеринга, который и так частичный (виджеты пришлось бы стилизовать по-разному под каждую платформу).
-3. TUI и так проще по составу (текст, рамки, без спрайт-анимаций) — потеря код-шеринга именно здесь обходится дёшево.
-
-### 2.2 Принятое решение
-
-Два независимых, нативных для своей экосистемы стека:
-
-- **Web:** React + `react-dom` + Canvas2D — как и раньше, для сохранения pixel-perfect 1-bit эстетики (раздел 5).
-- **TUI:** **Go + `bubbletea`** — компилируемый, нативный, без отдельного JS-рантайма (раздел 6). Тот же язык, что и backend-ядро (`backend.md`) — в отличие от первой версии этого решения (Rust), это даёт настоящую синергию общих типов API-контракта, а не задокументированный trade-off (`backend.md §11.1`).
-
-Общим между ними является не код, а **контракт** — и контракт здесь неоднороден по своей природе. Часть его — это протокол, который придумывает и поддерживает сам UI-слой (какие бывают действия ввода, как устроен стек навигации). А часть — это **данные, которыми в рантайме владеет backend**: какие приложения/экраны вообще существуют в системе прямо сейчас, определяется не UI-репозиторием, а установленными на устройстве backend-плагинами (см. раздел 4.2). Обе UI-реализации не хранят список приложений у себя — они спрашивают его у backend при старте, как любые другие данные.
+## High-level overall architecture (for reference)
 
 ```mermaid
 flowchart TB
-    subgraph PROTOCOL["Протокол — UI-side спецификация, НЕ данные backend"]
-        direction LR
-        C1["input-actions\n(Up/Down/Ok/Back/AppSwitch/...)"]
-        C4["navigation-semantics\n(стек экранов, overlay-стек)"]
+    WEB["**Web browser**<br>or local Cog/WPE"]
+    TUI["**TUI**<br>Go + bubbletea, local/SSH"]
+    REMOTE["**Remote HW**"]
+
+    CADDY["**Caddy**<br>Web build static files + reverse proxy /api/*"]
+
+    subgraph CORE["**flipctld** — backend core (Go)"]
+        API["HTTP + SSE API"]
+        REG["Plugin Registry"]
+        JM["Job Manager"]
+        BUS["Event Bus"]
     end
 
-    subgraph BACKEND["flipctld — источник правды в рантайме (backend.md)"]
+    subgraph PLUGINS["Plugins — separate processes"]
+        SYS["system: wifi, power, ..."]
+        COM["community: ping, nmap, ..."]
+    end
+
+    subgraph OS["Linux (SBC)"]
+        DBUS["D-Bus: NetworkManager, systemd"]
+        BIN["CLI utilities"]
+    end
+
+    WEB --> CADDY -- "HTTP/SSE" --> API
+    REMOTE -- "SSH" --> TUI
+    TUI -- "HTTP/SSE" --> API
+    API --> REG
+    API --> JM
+    JM -- "spawn + NDJSON/stdio" --> PLUGINS
+    PLUGINS -- events --> BUS --> API
+    SYS --> DBUS
+    COM --> BIN
+```
+
+## 1. Problem statement and constraints
+
+From `README.md`:
+
+- The UI today is HTML/JS, rendered by headless WebKit (Cog) directly on DRM, without Xorg/Wayland.
+- We want several renderers for one UI: at minimum Web and TUI, with an eye toward a hardware target in the future.
+- Web must be pixel-perfect: a 1-bit/grayscale style on a 256×144 screen (see `fake-flipctl2`), custom bitmap fonts, sprites.
+- **TUI doesn't need to be pixel-perfect.** It's not "the same screen in text form," but a full text interface with its own terminal aesthetic. Web and TUI need to be recognizably the same navigation/structure, but aren't required to match visually.
+- The device is embedded, with limited resources and power consumption in mind. An extra resident runtime (a JS engine, a WASM runtime) on the TUI side isn't a free abstraction — it's a real line item of RAM/CPU/battery cost, especially if the TUI is launched interactively (an SSH session, a local terminal).
+
+This directly drives the document's key architectural decision (section 2): rejecting the idea of "one React tree for both targets" in favor of two independent, platform-idiomatic implementations connected by a shared *contract*, not a shared *runtime*.
+
+---
+
+## 2. Key decision: a shared contract, not a shared component tree
+
+### 2.1 Considered and rejected alternative
+
+The first version of this document proposed a React Native/Ink/Dioxus-style pattern: one React tree, two React reconcilers (`react-dom` for Web, `@opentui/react` for TUI), a shared Yoga layout to keep coordinates in sync. The approach has mature precedents (React Native + react-native-web, Ink, Dioxus with a ratatui-based TUI renderer) — and it remains a valid choice for projects where the TUI also needs to be pixel-perfect, or where Node/Bun is already guaranteed on the TUI side.
+
+Reason for rejecting it specifically for FlipCTL:
+
+1. The TUI doesn't need to be pixel-perfect → the main argument for "draw both through a shared low-level canvas/cell-buffer API" disappears.
+2. The resource-saving requirement on an embedded device makes Node/Bun/OpenTUI+Yoga(WASM) on the TUI side an unjustified price for code sharing that would be partial anyway (widgets would still need different styling per platform).
+3. The TUI is simpler in composition anyway (text, frames, no sprite animations) — losing code sharing right here is cheap.
+
+### 2.2 Decision made
+
+Two independent stacks, each native to its own ecosystem:
+
+- **Web:** React + `react-dom` + Canvas2D — as before, to preserve the pixel-perfect 1-bit aesthetic (section 5).
+- **TUI:** **Go + `bubbletea`** — compiled, native, with no separate JS runtime at all (section 6). The same language as the backend core (`backend.md`) — unlike the first version of this decision (Rust), this gives real synergy on shared API-contract types rather than a documented trade-off (`backend.md §11.1`).
+
+What's shared between them isn't code, but a **contract** — and the contract here isn't uniform in nature. Part of it is a protocol that the UI layer itself invents and maintains (what input actions exist, how the navigation stack works). Part of it is **data owned by the backend at runtime**: which apps/screens even exist in the system right now is determined not by the UI repository, but by the backend plugins installed on the device (see section 4.2). Neither UI implementation stores the app list itself — both ask the backend for it at startup, like any other data.
+
+```mermaid
+flowchart TB
+    subgraph PROTOCOL["Protocol — a UI-side spec, NOT backend data"]
         direction LR
-        REG["GET /api/registry\n(kind: custom | generic — специфицирован в backend.md §7)"]
-        API["/api/wifi, /api/power, ...\n(контракт путей не меняется, backend.md §11)"]
+        C1["input-actions\n(Up/Down/Ok/Back/AppSwitch/...)"]
+        C4["navigation-semantics\n(screen stack, overlay stack)"]
+    end
+
+    subgraph BACKEND["flipctld — source of truth at runtime (backend.md)"]
+        direction LR
+        REG["GET /api/registry\n(kind: custom | generic — specified in backend.md §7)"]
+        API["/api/wifi, /api/power, ...\n(path contract unchanged, backend.md §11)"]
     end
 
     subgraph WEB["Web — TypeScript/React"]
@@ -62,15 +98,15 @@ flowchart TB
     end
 
     subgraph TUI["TUI — Go/bubbletea"]
-        T1["navigator.go: Screen-стек"]
+        T1["navigator.go: Screen stack"]
         T2["widgets/: MenuLine, StatusBar, PopupMenu, genericAction.go"]
         T3["screens/: menu, wifi, ethernet, power, ..."]
         T4["renderer: bubbletea + lipgloss"]
         T1 --> T2 --> T3 --> T4
     end
 
-    PROTOCOL -.реализуется независимо.-> WEB
-    PROTOCOL -.реализуется независимо.-> TUI
+    PROTOCOL -.implemented independently.-> WEB
+    PROTOCOL -.implemented independently.-> TUI
 
     W3 -->|"fetch()"| REG
     W3 -->|"fetch()"| API
@@ -80,50 +116,50 @@ flowchart TB
 
 ---
 
-## 3. Что переносим из `fake-flipctl2`
+## 3. What we're carrying over from `fake-flipctl2`
 
-| Модуль прототипа | Роль | Судьба |
+| Prototype module | Role | Fate |
 |---|---|---|
-| `js/canvas.js` (`FlipCanvas`) | Рисование пикселей/спрайтов/иконок в canvas | Логика растеризации портируется в Web `renderer` практически как есть (раздел 5). TUI её не использует. |
-| `js/scene.js` (`SceneManager`) | Стек экранов: push/pop/enter/exit | Семантика фиксируется в `contract/navigation-semantics`; на Web реализуется как React `Navigator` (Context/reducer); на TUI — ни `bubbletea`, ни (раньше) `ratatui` не имеют встроенного стека экранов, поэтому `Navigator` строится сами поверх примитива фреймворка — в Go это `tea.Model`, хранящий `stack []Screen` и делегирующий `Update`/`View` вершине стека. Семантика push/pop/enter/exit та же, стиль — функциональный (Elm-архитектура: `Update` возвращает новый `Screen`, а не мутирует старый), не императивный, как был бы в Rust. |
-| `js/input.js` (`Input`, `KEY_MAP`) | Клавиша → семантическое действие | Семантика (`Up/Down/Left/Right/Ok/Back/AppSwitch/Ptt/Edit/Delete/Power`) фиксируется в `contract/input-actions`; на Web — `DomKeyboardAdapter` (`keydown`/`keyup`); на TUI — маппинг `tea.KeyMsg` → тот же enum (Go `const`-блок). |
-| `js/apps/*.js` (~30 сцен) | Экран = `{enter, exit, handleInput, render}` | На Web переписываются как React-компоненты. На TUI — как типы, реализующие интерфейс `Screen`, в своём пакете `screens/`. |
-| `js/component-library/*.js`, `js/ui.js` | MenuLine, ResponsiveFrame, PopupMenu, Keyboard, MessageBox, Scrollbar, TextInputBox/InputField | На Web переносятся как React-компоненты почти 1:1. На TUI — переиспользуется **нейминг и семантика** (свой `widgets/menuLine.go` и т.д.), реализация — Go + `lipgloss` для стилизации, где возможно — готовые компоненты `bubbles` (`bubbles/list`, `bubbles/textinput`, `bubbles/viewport`) вместо написания с нуля. Виртуальная экранная `Keyboard` в TUI, скорее всего, **не нужна** — в терминале уже есть настоящая клавиатура (см. раздел 8). |
-| `js/running_apps.js` | MRU-список открытых приложений, статический список сцен в `index.html` | Список приложений перестаёт быть чем-то, что живёт в UI-репозитории вообще. Он приходит от backend в рантайме (`GET /api/registry`, раздел 4.2) — MRU-список открытых окон (App Switcher) остаётся локальным UI-состоянием (что сейчас открыто), а *какие приложения в принципе бывают* — данные backend, отражающие установленные плагины. |
-| `js/font.js`, `js/haxrcorp16.js`, `js/busy9.js`, `js/born2bsportyv2.js`, `js/icons.js`, `js/sprites.js`, `js/animated_icons.js` | Bit-packed данные шрифтов/иконок/спрайтов | Используются **только Web-рендерером** (раздел 7). TUI их не потребляет — иконки в терминале представлены короткими текстовыми лейблами/символами через отдельную небольшую таблицу соответствия `icon-id → &str`. |
-| `ttf-to-js.py`, `png-to-bitmap.py` | Офлайн-конвертация TTF/PNG → JS | Остаются Web-only частью asset-пайплайна. |
-| `server.js` (`/api/*`) | HTTP API поверх системных утилит | **Заменяется на `flipctld`** — полностью переосмыслен как супервизор плагинов, а не файл с хендлерами (см. `backend.md`). Контракт путей (`/api/*`) сохраняется, поэтому Web (`fetch`) и TUI (`net/http`) обращаются к нему без изменений в своём коде. |
+| `js/canvas.js` (`FlipCanvas`) | Drawing pixels/sprites/icons on canvas | The rasterization logic is ported into the Web `renderer` almost as-is (section 5). The TUI doesn't use it. |
+| `js/scene.js` (`SceneManager`) | The screen stack: push/pop/enter/exit | The semantics are fixed in `contract/navigation-semantics`; on Web it's implemented as a React `Navigator` (Context/reducer); on TUI — neither `bubbletea` nor (previously) `ratatui` has a built-in screen stack, so the `Navigator` is built by hand on top of the framework's primitive — in Go that's a `tea.Model` holding a `stack []Screen` and delegating `Update`/`View` to the top of the stack. The push/pop/enter/exit semantics are the same; the style is functional (Elm architecture: `Update` returns a new `Screen` rather than mutating the old one), not imperative the way it would be in Rust. |
+| `js/input.js` (`Input`, `KEY_MAP`) | Key → semantic action | The semantics (`Up/Down/Left/Right/Ok/Back/AppSwitch/Ptt/Edit/Delete/Power`) are fixed in `contract/input-actions`; on Web — `DomKeyboardAdapter` (`keydown`/`keyup`); on TUI — mapping `tea.KeyMsg` → the same enum (a Go `const` block). |
+| `js/apps/*.js` (~30 scenes) | Screen = `{enter, exit, handleInput, render}` | Rewritten as React components on Web. On TUI — as types implementing the `Screen` interface, in their own `screens/` package. |
+| `js/component-library/*.js`, `js/ui.js` | MenuLine, ResponsiveFrame, PopupMenu, Keyboard, MessageBox, Scrollbar, TextInputBox/InputField | Carried over as React components almost 1:1 on Web. On TUI — the **naming and semantics** are reused (its own `widgets/menuLine.go` etc.), the implementation is Go + `lipgloss` for styling, and where possible, ready-made `bubbles` components (`bubbles/list`, `bubbles/textinput`, `bubbles/viewport`) instead of writing them from scratch. The prototype's virtual on-screen `Keyboard` most likely **isn't needed** on TUI — the terminal already implies a real keyboard (see section 8). |
+| `js/running_apps.js` | The MRU list of open apps, a static list of scenes in `index.html` | The app list stops being something that lives in the UI repository at all. It comes from the backend at runtime (`GET /api/registry`, section 4.2) — the MRU list of open windows (the App Switcher) remains local UI state (what's currently open), while *what apps even exist* is backend data reflecting installed plugins. |
+| `js/font.js`, `js/haxrcorp16.js`, `js/busy9.js`, `js/born2bsportyv2.js`, `js/icons.js`, `js/sprites.js`, `js/animated_icons.js` | Bit-packed font/icon/sprite data | Used **only by the Web renderer** (section 7). The TUI doesn't consume them — terminal icons are represented by short text labels/symbols via a separate small `icon-id → &str` lookup table. |
+| `ttf-to-js.py`, `png-to-bitmap.py` | Offline TTF/PNG → JS conversion | Stay a Web-only part of the asset pipeline. |
+| `server.js` (`/api/*`) | An HTTP API over system utilities | **Replaced by `flipctld`** — completely rethought as a plugin supervisor rather than a file of handlers (see `backend.md`). The path contract (`/api/*`) is preserved, so Web (`fetch`) and TUI (`net/http`) talk to it with no changes to their own code. |
 
 ---
 
-## 4. Контракт — что в нём осталось, и что теперь отдаёт backend
+## 4. Contract — what's left in it, and what the backend now provides
 
-После пересмотра (раздел 4.2) контракт перестал быть однородным набором файлов в UI-репозитории. Теперь это два принципиально разных источника правды.
+After the revision (section 4.2), the contract is no longer a uniform set of files in the UI repository. Now it's two fundamentally different sources of truth.
 
-### 4.1 Протокол — по-прежнему UI-side спецификация
+### 4.1 Protocol — still a UI-side spec
 
-То, что backend в принципе не касается — семантика взаимодействия с интерфейсом, а не предметная область системы:
+What the backend has no business with — the semantics of interacting with the interface, not the system's problem domain:
 
-- **`input-actions`** — enum из ~11 значений (`Up/Down/Left/Right/Ok/Back/AppSwitch/Ptt/Edit/Delete/Power`). Backend не может знать, что означает нажатие физической кнопки или клавиши стрелки — это исключительно про то, как Web и TUI интерпретируют ввод.
-- **`navigation-semantics`** — модель стека экранов (push/pop/popToRoot, отдельный overlay-стек для попапов/App Switcher).
+- **`input-actions`** — an enum of ~11 values (`Up/Down/Left/Right/Ok/Back/AppSwitch/Ptt/Edit/Delete/Power`). The backend can't know what pressing a physical button or an arrow key means — this is purely about how Web and TUI interpret input.
+- **`navigation-semantics`** — the screen-stack model (push/pop/popToRoot, a separate overlay stack for popups/the App Switcher).
 
-Обе спецификации небольшие, стабильные, меняются редко — документируются как markdown-спецификация и реализуются независимо (TS-enum на Web, Go `const`-enum на TUI), без общего файла-данных, потому что шарить, по сути, нечего — это не данные, а поведение.
+Both specs are small, stable, and change rarely — documented as a markdown spec and implemented independently (a TS enum on Web, a Go `const` enum on TUI), with no shared data file, because there's essentially nothing to share — it's behavior, not data.
 
-### 4.2 App Registry — данные времени выполнения, источник правды — backend
+### 4.2 App Registry — runtime data, source of truth is the backend
 
-Ключевая поправка этого раздела: **список приложений/экранов не хранится в UI-репозитории вообще**, ни как статический файл, ни как build-time константа. Он приходит от backend в рантайме, потому что именно backend знает, какие плагины-обёртки (`ping`, `nmap`, wifi-менеджер и т.д. — см. README про систему плагинов) установлены и включены на конкретном устройстве прямо сейчас. И Web, и TUI запрашивают его при старте так же, как любые другие данные — через новый эндпоинт `GET /api/registry`.
+The key correction in this section: **the list of apps/screens isn't stored in the UI repository at all**, not as a static file, not as a build-time constant. It comes from the backend at runtime, because it's the backend that knows which wrapper plugins (`ping`, `nmap`, a Wi-Fi manager, etc. — see the README on the plugin system) are installed and enabled on a given device right now. Both Web and TUI request it at startup the same way they request any other data — through a new `GET /api/registry` endpoint.
 
-**Это требует нового backend-эндпоинта, которого сегодня нет в `server.js`.** Он полностью специфицирован в `backend.md §7` (реализация — проекция `Plugin Registry`, `backend.md §8`) — сама реализация вне кода этого репозитория, но контракт больше не открытый вопрос.
+**This requires a new backend endpoint that doesn't exist in `server.js` today.** It's fully specified in `backend.md §7` (implementation — a `Plugin Registry` projection, `backend.md §8`) — the implementation itself is outside this repository's code, but the contract is no longer an open question.
 
-Каждый элемент реестра размечен полем `kind`, чтобы не тянуть в архитектуру общий язык описания произвольного UI (см. обсуждение в разделе 11 про пределы generic-подхода):
+Every registry entry is tagged with a `kind` field, so as not to drag a general-purpose "describe arbitrary UI" language into the architecture (see the discussion in section 11 on the limits of the generic approach):
 
-- **`kind: "custom"`** — экран целиком написан вручную в каждом frontend (Wi-Fi, Ethernet, Power, звук, TV — всё, что имеет нетривиальное поведение: список сетей, ввод пароля, аудио-стрим). Backend отдаёт только метаданные для меню/иконки; сам экран резолвится по `id` в статическую таблицу `id → компонент`, отдельную на Web и на TUI (раздел 3, было и в первой версии документа).
-- **`kind: "generic"`** — экран целиком описан данными: параметры перед запуском (`inputs`), статус-поля во время/после выполнения (`status_fields`) и список действий-кнопок (`actions`), каждое — вызов конкретного backend-эндпоинта. Рендерится **одним** общим компонентом на платформу (`GenericActionScreen` на Web, `generic_action.rs` на TUI), без единой платформо-специфичной строчки кода на новый плагин. Это прямой ответ на "видение системы плагинов для CLI-утилит" из README: простой wrapper (`ping`, `traceroute`) регистрирует себя описанием — и сразу появляется в обоих UI.
+- **`kind: "custom"`** — the screen is entirely hand-written in each frontend (Wi-Fi, Ethernet, Power, sound, TV — anything with non-trivial behavior: a network list, password entry, an audio stream). The backend only provides metadata for the menu/icon; the screen itself is resolved by `id` against a static `id → component` table, separate on Web and on TUI (section 3, also true in the document's first version).
+- **`kind: "generic"`** — the screen is entirely described by data: parameters before launch (`inputs`), status fields during/after execution (`status_fields`), and a list of action buttons (`actions`), each a call to a specific backend endpoint. Rendered by **one** shared component per platform (`GenericActionScreen` on Web, `generic_action.rs` on TUI), with no platform-specific code for each new plugin. This is a direct answer to the README's "vision for a plugin system for CLI utilities": a simple wrapper (`ping`, `traceroute`) registers itself with a description — and immediately appears in both UIs.
 
-Схема согласована с манифестом плагина из `backend.md §4.1` — `inputs`/`status_fields` здесь являются UI-проекцией `inputs`/`outputs` манифеста, тот же `ping` фигурирует в обоих документах с одинаковыми полями:
+The schema is aligned with the plugin manifest from `backend.md §4.1` — `inputs`/`status_fields` here are the UI projection of the manifest's `inputs`/`outputs`; the same `ping` appears in both documents with the same fields:
 
 ```jsonc
-// GET /api/registry — пример ответа (эндпоинт специфицирован в backend.md §7)
+// GET /api/registry — example response (the endpoint is specified in backend.md §7)
 [
   {
     "id": "wifi", "title": "Wi-Fi", "icon": "wifi", "category": "network",
@@ -149,36 +185,36 @@ flowchart TB
 ]
 ```
 
-`bind` — позиция в софт-кнопочной панели экрана (`slot:0..4` либо `input:<name>` для универсальных действий вроде `input:ptt`), проекция одноимённого поля манифеста (`backend.md §4.4`). При нажатии/отпускании frontend шлёт `POST {endpoint}` с телом `{"phase": "down" | "up"}` (`backend.md §7`) — press/release уже различаются на уровне `InputAdapter` (раздел 4.1), здесь это просто прокидывается дальше в backend.
+`bind` is a position on the screen's soft-button panel (`slot:0..4`, or `input:<name>` for universal actions like `input:ptt`), a projection of the manifest field of the same name (`backend.md §4.4`). On press/release, the frontend sends `POST {endpoint}` with body `{"phase": "down" | "up"}` (`backend.md §7`) — press/release are already distinguished at the `InputAdapter` level (section 4.1); here it's just forwarded on to the backend.
 
-`type` на поле (`text`/`number`/`select`/`list`) определяет, каким уже существующим виджетом UI Kit оно рисуется — новых примитивов для этого не требуется:
+The `type` on a field (`text`/`number`/`select`/`list`) determines which already-existing UI Kit widget draws it — no new primitives are needed for this:
 
-| `type` | Web/TUI виджет |
+| `type` | Web/TUI widget |
 |---|---|
-| `text` (input) | `TextInputBox`/`InputField` + виртуальная `Keyboard` (Web) / `bubbles/textinput` (TUI, раздел 6.2) |
-| `select` (input) | `PopupMenu` в роли пикера (Web) / `bubbles/list` в overlay (TUI) — уже есть в UI Kit (раздел 3) |
-| `text`/`number` (status) | обычная строка в `MenuLine`-подобной раскладке |
-| `list` (status) | `Scrollbar` + список строк — уже есть в UI Kit (раздел 3) |
+| `text` (input) | `TextInputBox`/`InputField` + a virtual `Keyboard` (Web) / `bubbles/textinput` (TUI, section 6.2) |
+| `select` (input) | `PopupMenu` acting as a picker (Web) / `bubbles/list` in an overlay (TUI) — already in the UI Kit (section 3) |
+| `text`/`number` (status) | a regular line in a `MenuLine`-style layout |
+| `list` (status) | `Scrollbar` + a list of lines — already in the UI Kit (section 3) |
 
-Для PoC (раздел 12) достаточно только `kind: "custom"` — он покрывает Wi-Fi/Ethernet из плана. `kind: "generic"` и связанный с ним namespace `/api/plugins/<id>/<action>` закладываются в схему заранее, чтобы не потребовалось breaking change, когда дойдёт очередь до настоящих CLI-wrapper плагинов.
+For the PoC (section 12), only `kind: "custom"` is needed — it covers Wi-Fi/Ethernet from the plan. `kind: "generic"` and its associated `/api/plugins/<id>/<action>` namespace are baked into the schema ahead of time, so no breaking change is needed once real CLI-wrapper plugins are due.
 
-### 4.3 API-контракт для остальных данных
+### 4.3 The API contract for everything else
 
-Форма JSON-ответов остальных `/api/*` эндпоинтов backend'а (`flipctld`, см. `backend.md`; исторически — `server.js`) — `/api/wifi`, `/api/power`, ... — контракт путей не меняется, хотя реализация под ними полностью переписывается. Web заводит у себя TS-интерфейсы (генерируются из `openapi.yaml`, вручную поддерживаются в соответствии со схемой); TUI, будучи на одном языке с backend, использует общий сгенерированный Go-пакет `contract/go/apitypes` (раздел 9) — без ручного мирроринга структур.
+The shape of JSON responses from the rest of the backend's (`flipctld`, see `backend.md`; historically `server.js`) `/api/*` endpoints — `/api/wifi`, `/api/power`, ... — the path contract doesn't change, though the implementation behind it is completely rewritten. Web maintains its own TS interfaces (generated from `openapi.yaml`, kept in sync with the schema by hand); the TUI, being in the same language as the backend, uses the shared generated Go package `contract/go/apitypes` (section 9) — no manual struct mirroring.
 
-Явно НЕ шарится: код виджетов, layout-логика, код рисования. Это осознанный trade-off раздела 2.
+Explicitly NOT shared: widget code, layout logic, drawing code. This is a deliberate trade-off from section 2.
 
 ---
 
 ## 5. Renderer: Web
 
-Не изменилось по сути относительно первой версии документа, с одним упрощением.
+Essentially unchanged from the document's first version, with one simplification.
 
-- **Стек:** React + `react-dom` + Vite + TypeScript.
-- **Pixel-perfect UI внутри DOM:** `ScreenFrame` — один `<canvas>` 256×144 (`image-rendering: pixelated`), управляемый декларативно через React (`ref` + `useLayoutEffect`). React отвечает за дерево компонентов/состояние/эффекты и за DOM-обвязку страницы; сам экран рисуется вызовами 2D-контекста, портированными из `js/canvas.js`, `js/font.js`, `js/icons.js`.
-- **Layout — без Yoga.** В первой версии документа Web и TUI должны были использовать общий flexbox-движок (Yoga) ради совпадения координат. Раз TUI больше не обязан визуально совпадать с Web, эта причина исчезла. Возвращаемся к тому, что и так уже хорошо работает в прототипе: **жёсткие пиксельные константы** (высота строки меню 20px, статус-бар 13px, безопасные отступы и т.д. — см. `fake_flipctl2_CLAUDE.md`) вместо отдельного layout-движка. Меньше зависимостей, меньше WASM, ничего не потеряно — экран фиксированного размера в динамическом flexbox и не нуждался.
-- **`PixelSurface` — узкая, оправданная абстракция на будущее.** В отличие от широкого `Primitives`-контракта Web/TUI из первой версии (упразднён), здесь остаётся один маленький интерфейс: `PixelSurface` с методами `fillRect/drawGlyph/drawSprite/...`, у которого сегодня одна реализация — `CanvasSurface` (обёртка над `HTMLCanvasElement`). Это специально готовит почву для **будущего hardware-таргета** (headless WebKit/Cog на DRM из README): рисование в браузерный canvas и рисование в реальный DRM dumb-buffer — операции одного рода (blit пикселей в буфер), и весь код поверх `PixelSurface` (шрифты, иконки, виджеты) не будет знать, какая реализация под ним. TUI в эту абстракцию не включается — у него принципиально другая модель отрисовки (текстовые ячейки, а не пиксели).
-- **Доступность и тестируемость.** `Box`/`Text`/`Pressable`-компоненты Web UI Kit параллельно с рисованием в canvas кладут в DOM невидимое (для глаз, видимое для скринридеров) accessibility-дерево с ролями/лейблами и `data-testid` — стандартный приём для canvas/WebGL-приложений, не блокирует Playwright/Testing Library тесты.
+- **Stack:** React + `react-dom` + Vite + TypeScript.
+- **Pixel-perfect UI inside the DOM:** `ScreenFrame` is a single 256×144 `<canvas>` (`image-rendering: pixelated`), managed declaratively through React (`ref` + `useLayoutEffect`). React handles the component tree/state/effects and the page's DOM shell; the screen itself is drawn via 2D-context calls ported from `js/canvas.js`, `js/font.js`, `js/icons.js`.
+- **Layout — no Yoga.** In the document's first version, Web and TUI were supposed to share a flexbox engine (Yoga) to keep coordinates in sync. Since the TUI no longer needs to visually match Web, that reason is gone. We go back to what already works well in the prototype: **fixed pixel constants** (a 20px menu-line height, a 13px status bar, safe margins, etc. — see `fake_flipctl2_CLAUDE.md`) instead of a separate layout engine. Fewer dependencies, less WASM, nothing lost — a fixed-size screen never needed a dynamic flexbox anyway.
+- **`PixelSurface` — a narrow, justified abstraction for the future.** Unlike the wide Web/TUI `Primitives` contract from the first version (dropped), only one small interface remains here: `PixelSurface`, with `fillRect`/`drawGlyph`/`drawSprite`/... methods, which today has one implementation — `CanvasSurface` (a wrapper around `HTMLCanvasElement`). This specifically lays the groundwork for a **future hardware target** (headless WebKit/Cog on DRM, from the README): drawing into a browser canvas and drawing into a real DRM dumb buffer are operations of the same kind (blitting pixels into a buffer), and all the code built on top of `PixelSurface` (fonts, icons, widgets) won't know which implementation is underneath. The TUI isn't part of this abstraction — it has a fundamentally different drawing model (text cells, not pixels).
+- **Accessibility and testability.** The Web UI Kit's `Box`/`Text`/`Pressable` components, alongside drawing to canvas, also place an invisible (to the eye, visible to screen readers) accessibility tree in the DOM with roles/labels and `data-testid` — a standard trick for canvas/WebGL apps, and it doesn't block Playwright/Testing Library tests.
 
 ```mermaid
 sequenceDiagram
@@ -197,19 +233,19 @@ sequenceDiagram
     SURF-->>User: repaint 256x144 canvas (requestAnimationFrame, event-driven)
 ```
 
-### Развёртывание: Caddy
+### Deployment: Caddy
 
-Продакшн-сборка (`vite build` → статические файлы) не обслуживается самим frontend-кодом — её раздаёт `Caddy`, отдельный процесс перед `flipctld` (полное описание — `backend.md §3.1`). Для Web-разработчика это означает: `fetch('/api/registry')` и остальные вызовы к `api-contract` (раздел 4) идут на тот же origin, что отдал `index.html` — Caddy прозрачно проксирует `/api/*` на backend, CORS не нужен ни в деве, ни в проде. Локальный Cog/WPE и внешний браузер заходят через одну и ту же точку входа Caddy, без разного поведения фронтенда в зависимости от того, кто его открыл.
+The production build (`vite build` → static files) isn't served by the frontend code itself — it's served by `Caddy`, a separate process in front of `flipctld` (full description — `backend.md §3.1`). For a Web developer this means: `fetch('/api/registry')` and the rest of the calls to the `api-contract` (section 4) go to the same origin that served `index.html` — Caddy transparently proxies `/api/*` to the backend, and no CORS handling is needed in dev or in production. A local Cog/WPE and an external browser reach the same UI through the same Caddy entry point, with no different frontend behavior depending on who opened it.
 
 ---
 
 ## 6. Renderer: TUI (Go + `bubbletea`)
 
-> Пересмотрено относительно предыдущей версии (Rust + `ratatui`): TUI переписан на Go специально ради синергии с backend-ядром (`backend.md`, тоже Go) — общие типы API-контракта вместо ручной синхронизации между языками. Само решение отказаться от общего React-дерева (раздел 2.1) не пересматривается — TUI по-прежнему нативный, компилируемый, без Node/JS-рантайма, просто теперь на другом языке, чем в первой ревизии.
+> Revised relative to the previous version (Rust + `ratatui`): the TUI has been rewritten in Go specifically for synergy with the backend core (`backend.md`, also Go) — shared API-contract types instead of manual synchronization between languages. The decision itself to drop a shared React tree (section 2.1) isn't being revisited — the TUI is still native, compiled, with no Node/JS runtime, just in a different language than in the first revision.
 
-### 6.1 Общая модель
+### 6.1 Overall model
 
-[`bubbletea`](https://github.com/charmbracelet/bubbletea) — TUI-фреймворк Charm на Elm-архитектуре (Model/Update/View): `Update(tea.Msg) (tea.Model, tea.Cmd)` возвращает новую модель, а не мутирует старую; перерисовка — по событию (bubbletea сам диффит кадры), тот же принцип redraw-on-change, что и в прототипе, просто в функциональном, а не императивном стиле. [`lipgloss`](https://github.com/charmbracelet/lipgloss) — стилизация и layout поверх ANSI (Padding, Border, `JoinHorizontal`/`JoinVertical`, деградация цвета под возможности терминала). [`bubbles`](https://github.com/charmbracelet/bubbles) — готовая библиотека компонентов той же команды (list, viewport, textinput, spinner, table) — часть виджетов ниже не пишется с нуля, а собирается поверх неё.
+[`bubbletea`](https://github.com/charmbracelet/bubbletea) is Charm's TUI framework built on the Elm architecture (Model/Update/View): `Update(tea.Msg) (tea.Model, tea.Cmd)` returns a new model rather than mutating the old one; repainting happens on events (bubbletea diffs frames itself) — the same redraw-on-change principle as in the prototype, just in a functional rather than imperative style. [`lipgloss`](https://github.com/charmbracelet/lipgloss) handles styling and layout on top of ANSI (Padding, Border, `JoinHorizontal`/`JoinVertical`, color degradation based on terminal capability). [`bubbles`](https://github.com/charmbracelet/bubbles) is a ready-made component library from the same team (list, viewport, textinput, spinner, table) — some of the widgets below aren't written from scratch, they're assembled on top of it.
 
 ```mermaid
 classDiagram
@@ -253,45 +289,45 @@ classDiagram
     Navigator ..> InputAction : dispatches
 ```
 
-- Ни `bubbletea`, ни (в первой ревизии) `ratatui` не имеют встроенного стека экранов — bubbletea управляет ровно одной корневой моделью. `Navigator` сам реализует `tea.Model` (это единственное, что видит рантайм bubbletea) и внутри себя хранит `stack []Screen`, делегируя `Update`/`View` вершине стека — прямой аналог `SceneManager` из прототипа (раздел 3), просто построенный поверх Elm-архитектуры, а не поверх мутабельных объектов.
-- Переходы (push/pop) — это `tea.Cmd`, возвращаемые самим `Screen` при обработке `Update` (например, нажатие Ok на пункте меню возвращает команду `pushScreenMsg{WifiScreen{}}`), которые `Navigator` перехватывает и применяет к стеку.
-- Overlay-стек (App Switcher, popup, диалоги подтверждения) — второй такой же стек, рендерится поверх основного через наложение строк (`lipgloss.Place`), без специальных ухищрений.
+- Neither `bubbletea` nor (in the first revision) `ratatui` has a built-in screen stack — bubbletea manages exactly one root model. The `Navigator` implements `tea.Model` itself (that's the only thing the bubbletea runtime sees) and internally holds a `stack []Screen`, delegating `Update`/`View` to the top of the stack — a direct analogue of the prototype's `SceneManager` (section 3), just built on top of the Elm architecture rather than on mutable objects.
+- Transitions (push/pop) are `tea.Cmd`s returned by a `Screen` itself while handling `Update` (e.g. pressing Ok on a menu item returns a `pushScreenMsg{WifiScreen{}}` command), which the `Navigator` intercepts and applies to the stack.
+- The overlay stack (App Switcher, popups, confirmation dialogs) is a second, identical stack, rendered on top of the main one by overlaying strings (`lipgloss.Place`), with no special tricks.
 
-### 6.2 Widgets (`widgets/`) — параллельная (не общая) реализация UI Kit
+### 6.2 Widgets (`widgets/`) — a parallel (not shared) implementation of the UI Kit
 
-Виджеты называются так же, как в Web UI Kit (`MenuLine`, `StatusBar`, `PopupMenu`, `Dialog`, `Scrollbar`), чтобы инженеру, читающему оба стека, не приходилось держать в голове два словаря — реализация независимая, Go + `lipgloss`, где возможно — поверх готовых `bubbles`-компонентов вместо написания с нуля:
+Widgets are named the same as in the Web UI Kit (`MenuLine`, `StatusBar`, `PopupMenu`, `Dialog`, `Scrollbar`), so an engineer reading both stacks doesn't have to keep two vocabularies in their head — the implementation is independent, Go + `lipgloss`, and where possible built on top of ready-made `bubbles` components instead of writing from scratch:
 
-| Виджет | Реализация |
+| Widget | Implementation |
 |---|---|
-| `Scrollbar` / список | `bubbles/viewport` + `bubbles/list` |
+| `Scrollbar` / a list | `bubbles/viewport` + `bubbles/list` |
 | `TextInputBox`/`InputField` | `bubbles/textinput` |
-| `PopupMenu` / пикер (`select`-inputs, раздел 4.2) | `bubbles/list` в overlay |
-| `StatusBar`, `MenuLine`, `Dialog` | свой Go + `lipgloss`, готовых аналогов в `bubbles` нет |
+| `PopupMenu` / a picker (`select` inputs, section 4.2) | `bubbles/list` in an overlay |
+| `StatusBar`, `MenuLine`, `Dialog` | our own Go + `lipgloss`, no ready-made analogue in `bubbles` |
 
-Виртуальная on-screen `Keyboard` из прототипа в TUI по-прежнему не нужна — SSH/локальный терминал уже подразумевают физическую клавиатуру; текстовый ввод — `bubbles/textinput`, без экранной раскладки QWERTY.
+The prototype's virtual on-screen `Keyboard` still isn't needed on the TUI — SSH/a local terminal already imply a physical keyboard; text input is `bubbles/textinput`, with no on-screen QWERTY layout.
 
-Отдельный виджет `genericAction.go` — рендерер для `kind: "generic"` элементов реестра (раздел 4.2): список статус-полей + кнопки действий, построенные по JSON-описанию от `GET /api/registry`, без собственного пакета в `screens/` на каждый новый CLI-wrapper плагин. Прямой аналог Web-компонента `GenericActionScreen`.
+A separate `genericAction.go` widget renders `kind: "generic"` registry entries (section 4.2): a list of status fields + action buttons, built from the JSON description in `GET /api/registry`, with no dedicated package in `screens/` for every new CLI-wrapper plugin. A direct analogue of the Web `GenericActionScreen` component.
 
 ### 6.3 Input
 
-bubbletea доставляет нажатия как `tea.KeyMsg` в `Update`; тонкий маппер в начале `Navigator.Update` переводит `msg.String()`/`msg.Type` в тот же `InputAction`, что определён в контракте (раздел 4) — стрелки, Enter→Ok, Esc/Backspace→Back, Tab→AppSwitch и т.д. Никакого отдельного адаптера как отдельного компонента не нужно — это просто функция на входе `Update`.
+bubbletea delivers key presses as `tea.KeyMsg` into `Update`; a thin mapper at the top of `Navigator.Update` translates `msg.String()`/`msg.Type` into the same `InputAction` defined in the contract (section 4) — arrows, Enter→Ok, Esc/Backspace→Back, Tab→AppSwitch, etc. No separate adapter as its own component is needed — it's just a function at the entry of `Update`.
 
-### 6.4 Данные
+### 6.4 Data
 
-Тонкий HTTP-клиентский слой (`data/`), аналог Web-пакета `data`, обращается к тем же `/api/*` эндпоинтам backend'а (`flipctld`, см. `backend.md`):
+A thin HTTP client layer (`data/`), the analogue of the Web `data` package, talks to the same `/api/*` endpoints on the backend (`flipctld`, see `backend.md`):
 
-- HTTP-запросы — стандартный `net/http`, сторонний крейт/пакет не нужен (в отличие от Rust-версии, где выбирали между `ureq`/`reqwest`).
-- SSE (`GET /api/jobs/{id}/events`, `backend.md §7`) — формат тривиальный (`data: {...}\n\n`), читается построчно через `bufio.Scanner` поверх `resp.Body`; библиотека вроде `r3labs/sse` — опция, если понадобится готовый reconnect/`Last-Event-ID`, не обязательна для PoC.
-- JSON — стандартный `encoding/json`.
-- **Реальная синергия с backend, а не задокументированный на будущее план:** т.к. `flipctld` и TUI теперь оба на Go, типы API-контракта генерируются один раз из `contract/openapi.yaml` (`oapi-codegen`) в общий Go-пакет и импортируются напрямую и в `flipctld`, и в TUI-бинарник — без ручного мирроринга структур и без кодогенерации на границе TUI↔backend (раздел 9, `backend.md §11.1`). Для Web (TypeScript) кодогенерация из того же `openapi.yaml` остаётся отдельным шагом (`openapi-typescript`) — Web неизбежно другой язык.
+- HTTP requests — standard `net/http`, no third-party crate/package needed (unlike the Rust version, where we chose between `ureq`/`reqwest`).
+- SSE (`GET /api/jobs/{id}/events`, `backend.md §7`) — the format is trivial (`data: {...}\n\n`), read line by line via a `bufio.Scanner` over `resp.Body`; a library like `r3labs/sse` is an option if a ready-made reconnect/`Last-Event-ID` is needed, not required for the PoC.
+- JSON — standard `encoding/json`.
+- **Real synergy with the backend, not a plan documented for later:** since `flipctld` and the TUI are now both on Go, API-contract types are generated once from `contract/openapi.yaml` (`oapi-codegen`) into a shared Go package and imported directly into both `flipctld` and the TUI binary — no manual struct mirroring, and no codegen step at the TUI↔backend boundary (section 9, `backend.md §11.1`). For Web (TypeScript), codegen from the same `openapi.yaml` remains a separate step (`openapi-typescript`) — Web is inevitably a different language.
 
-### 6.5 Развёртывание: локальный терминал и SSH
+### 6.5 Deployment: local terminal and SSH
 
-Компилируемый нативный бинарник без внешнего рантайма — оба сценария из README закрываются простыми, стандартными для embedded-Linux средствами, ничего не изменилось по сравнению с первой ревизией на уровне подхода:
+A compiled native binary with no external runtime — both scenarios from the README are covered by simple, standard embedded-Linux means; nothing has changed at the approach level compared to the first revision:
 
-- **Локальный терминал:** systemd getty-юнит на выделенном tty (`ExecStart=/usr/bin/flipctl-tui`, autologin) — прямой аналог того, как в прототипе `cage`-юнит поднимает Cog/Web-kiosk на своём tty.
-- **SSH, вариант А (рекомендуется для PoC):** обычный системный `sshd` + forced command / выделенный логин-шелл для пользователя `flipctl` (`ForceCommand /usr/bin/flipctl-tui` в `sshd_config` или `command=` в `authorized_keys`). `ssh flipctl@host` сразу роняет в TUI. Используется уже настроенная аутентификация/hardening системного sshd, ничего своего в области security не пишем — это соображение не зависит от языка TUI и остаётся в силе.
-- **SSH, вариант B (более естественный кандидат на будущее, чем был `russh`):** [`wish`](https://github.com/charmbracelet/wish) — SSH-middleware из той же экосистемы Charm, что и `bubbletea`, с готовым `bubbletea`-middleware (`wish/bubbletea`), поднимающим отдельную bubbletea-сессию почти без кода на каждое подключение. Интеграция заметно менее самодельная, чем была бы с `russh` в Rust-версии — но политику аутентификации всё равно нужно проектировать самим, поэтому для PoC вариант А по-прежнему проще и меньше риска.
+- **Local terminal:** a systemd getty unit on a dedicated tty (`ExecStart=/usr/bin/flipctl-tui`, autologin) — a direct analogue of how the `cage` unit brings up the Cog/Web kiosk on its tty in the prototype.
+- **SSH, option A (recommended for the PoC):** the regular system `sshd` + a forced command / a dedicated login shell for the `flipctl` user (`ForceCommand /usr/bin/flipctl-tui` in `sshd_config`, or `command=` in `authorized_keys`). `ssh flipctl@host` drops straight into the TUI. Already-configured system-sshd authentication/hardening is reused; we write nothing of our own in the security space — this consideration doesn't depend on the TUI's language and still holds.
+- **SSH, option B (a more natural future candidate than `russh` used to be):** [`wish`](https://github.com/charmbracelet/wish) — an SSH middleware from the same Charm ecosystem as `bubbletea`, with a ready-made `bubbletea` middleware (`wish/bubbletea`) that brings up a separate bubbletea session with almost no code on every connection. The integration is noticeably less homegrown than it would have been with `russh` in the Rust version — but the authentication policy still has to be designed ourselves, so option A remains simpler and lower-risk for the PoC.
 
 ```mermaid
 sequenceDiagram
@@ -304,126 +340,126 @@ sequenceDiagram
     User->>TTY: presses Down arrow
     TTY->>BT: raw key bytes -> tea.KeyMsg
     BT->>NAV: Update(tea.KeyMsg)
-    NAV->>NAV: KeyMsg -> InputAction.Down (по контракту)
+    NAV->>NAV: KeyMsg -> InputAction.Down (per contract)
     NAV->>SCR: Update(InputAction.Down)
     SCR-->>NAV: (newScreen, cmd) — selectedIndex++
-    NAV->>BT: View() -> lipgloss-строка
-    BT-->>User: diff предыдущего/нового кадра -> ANSI escape sequences
+    NAV->>BT: View() -> lipgloss string
+    BT-->>User: diff of previous/new frame -> ANSI escape sequences
 ```
 
 ---
 
-## 7. Asset pipeline — теперь Web-only
+## 7. Asset pipeline — now Web-only
 
-Раз TUI не потребляет пиксельные ассеты, пайплайн упрощается до одной ветки (было — общий манифест для двух потребителей):
+Since the TUI doesn't consume pixel assets, the pipeline simplifies down to a single branch (it used to be a shared manifest for two consumers):
 
 ```mermaid
 flowchart LR
-    TTF["*.ttf (Haxrcorp16, Busy9, Born2bSportyV2)"] --> CONV1["font-to-bits (преемник ttf-to-js.py)"]
-    PNG["*.png спрайты/иконки"] --> CONV2["sprite-to-bits (преемник png-to-bitmap.py)"]
+    TTF["*.ttf (Haxrcorp16, Busy9, Born2bSportyV2)"] --> CONV1["font-to-bits (successor to ttf-to-js.py)"]
+    PNG["*.png sprites/icons"] --> CONV2["sprite-to-bits (successor to png-to-bitmap.py)"]
     CONV1 --> MANIFEST["packages/assets\nglyphs.json / icons.json / sprites.json"]
     CONV2 --> MANIFEST
-    MANIFEST --> DOMDRAW["Web renderer:\nbits -> ctx.fillRect() через PixelSurface"]
+    MANIFEST --> DOMDRAW["Web renderer:\nbits -> ctx.fillRect() via PixelSurface"]
 ```
 
-Единственное, что действительно нужно шарить между Web и TUI на уровне ассетов — это **семантическое имя** иконки (`icon: "wifi"`, `icon: "battery"`, ...), которое теперь приходит от backend как поле `icon` в ответе `GET /api/registry` (раздел 4.2), а не хранится в UI-репозитории. Web резолвит его в bit-packed спрайт; TUI резолвит его в короткий текстовый лейбл/символ через собственную небольшую статическую таблицу (`icon_glyphs.rs`, что-то вроде `"wifi" => "WiFi"`, `"battery" => "[||| ]"`), без общего asset-формата.
+The only thing that genuinely needs to be shared between Web and TUI at the asset level is the icon's **semantic name** (`icon: "wifi"`, `icon: "battery"`, ...), which now comes from the backend as the `icon` field in the `GET /api/registry` response (section 4.2), rather than being stored in the UI repository. Web resolves it into a bit-packed sprite; TUI resolves it into a short text label/symbol via its own small static table (`icon_glyphs.rs`, something like `"wifi" => "WiFi"`, `"battery" => "[||| ]"`), with no shared asset format.
 
 ---
 
-## 8. Что действительно общее, а что разное — сводка
+## 8. What's genuinely shared, and what's different — a summary
 
-| Аспект | Web | TUI | Общее? |
+| Aspect | Web | TUI | Shared? |
 |---|---|---|---|
-| Язык/рантайм | TypeScript, браузерный JS-движок (клиент) | Go, нативный бинарник | нет, но TUI теперь на одном языке с backend |
-| Навигация (push/pop, overlay-стек) | React `Navigator` (Context/reducer) | Go `Navigator` (`tea.Model`, `[]Screen`) | семантика — да (контракт), реализация — нет |
-| Семантика ввода (`Up/Down/Ok/Back/...`) | TS enum + `DomKeyboardAdapter` | Go `const`-enum + `tea.KeyMsg`-маппер | семантика — да (контракт), реализация — нет |
-| Список приложений/экранов (id, заголовок, категория) | `fetch("/api/registry")` | `http.Get("/api/registry")` | да — общий backend-эндпоинт (новый, раздел 4.2), не файл в репозитории |
-| API backend (`/api/wifi`, `/api/power`, ...) | `fetch()` | `net/http` | контракт формы данных — да, клиентский код — нет |
-| Типы API-контракта | генерируются отдельно (`openapi-typescript`) | общий Go-пакет с `flipctld` (`oapi-codegen`, `backend.md §11.1`) | да между TUI и backend буквально (одна кодовая база), с Web — только схема |
-| Виджеты (MenuLine, StatusBar, PopupMenu, ...) | React-компоненты поверх Canvas | Go + `lipgloss`/`bubbles` реализации | только нейминг/семантика, не код |
-| Рендеринг `kind: "generic"` экранов плагинов | `GenericActionScreen` (React) | `genericAction.go` (`lipgloss`/`bubbles`) | схема JSON — да, компонент рендеринга — нет (два независимых, но по одной схеме) |
-| Пиксельная точность / bitmap-шрифты, спрайты | да, это требование | нет, не требуется | нет |
-| On-screen виртуальная клавиатура | да (нет физической на устройстве) | не нужна (есть терминал/SSH-клиент с клавиатурой) | нет |
-| Layout-модель | фиксированные pixel-константы (как в прототипе) | `lipgloss` (Width/Height/Padding/`JoinHorizontal`/`JoinVertical`) | нет, разные модели, обе штатные для своей платформы |
+| Language/runtime | TypeScript, a browser JS engine (client-side) | Go, a native binary | No, but the TUI is now in the same language as the backend |
+| Navigation (push/pop, overlay stack) | A React `Navigator` (Context/reducer) | A Go `Navigator` (`tea.Model`, `[]Screen`) | Semantics — yes (contract), implementation — no |
+| Input semantics (`Up/Down/Ok/Back/...`) | A TS enum + `DomKeyboardAdapter` | A Go `const` enum + a `tea.KeyMsg` mapper | Semantics — yes (contract), implementation — no |
+| The app/screen list (id, title, category) | `fetch("/api/registry")` | `http.Get("/api/registry")` | Yes — a shared backend endpoint (new, section 4.2), not a file in the repository |
+| Backend API (`/api/wifi`, `/api/power`, ...) | `fetch()` | `net/http` | Data-shape contract — yes, client code — no |
+| API-contract types | Generated separately (`openapi-typescript`) | A Go package shared with `flipctld` (`oapi-codegen`, `backend.md §11.1`) | Yes, literally, between TUI and backend (one codebase); with Web — only the schema |
+| Widgets (MenuLine, StatusBar, PopupMenu, ...) | React components on top of Canvas | Go + `lipgloss`/`bubbles` implementations | Naming/semantics only, not code |
+| Rendering `kind: "generic"` plugin screens | `GenericActionScreen` (React) | `genericAction.go` (`lipgloss`/`bubbles`) | The JSON schema — yes; the rendering component — no (two independent ones sharing one schema) |
+| Pixel accuracy / bitmap fonts, sprites | Yes, a requirement | No, not required | No |
+| An on-screen virtual keyboard | Yes (no physical one on the device) | Not needed (there's a terminal/SSH client with a keyboard) | No |
+| Layout model | Fixed pixel constants (as in the prototype) | `lipgloss` (Width/Height/Padding/`JoinHorizontal`/`JoinVertical`) | No, different models, each standard for its own platform |
 
 ---
 
-## 9. Монорепо / структура репозитория
+## 9. Monorepo / repository structure
 
-Поскольку Web и TUI всё ещё разноязыкие (TypeScript vs Go), разумно разделить toolchain-ы, но держать `contract/` в корне как общую точку правды — и для протокола, и (теперь) для сгенерированных Go-типов, общих с backend:
+Since Web and TUI are still in different languages (TypeScript vs. Go), it makes sense to keep the toolchains separate, but keep `contract/` at the root as a shared source of truth — both for the protocol, and now also for the generated Go types shared with the backend:
 
 ```
 flipctl-ui/
-├── contract/                      # см. contract/README.md в корне репозитория
-│   ├── input-actions.md         # спецификация enum InputAction
-│   ├── navigation-semantics.md  # спецификация стека навигации/overlay
-│   ├── openapi.yaml             # HTTP/SSE API backend'а (flipctld), включая GET /api/registry
-│   ├── manifest.schema.json     # схема манифеста плагина (см. backend.md §4)
-│   ├── ipc-messages.schema.json # схема NDJSON-протокола flipctld<->плагин (см. backend.md §5)
-│   └── go/apitypes/             # oapi-codegen из openapi.yaml — общий Go-пакет,
-│                                 # импортируется и flipctld (backend.md), и tui/ напрямую
+├── contract/                      # see contract/README.md at the repo root
+│   ├── input-actions.md         # the InputAction enum spec
+│   ├── navigation-semantics.md  # the navigation/overlay stack spec
+│   ├── openapi.yaml             # the backend's (flipctld) HTTP/SSE API, including GET /api/registry
+│   ├── manifest.schema.json     # the plugin manifest schema (see backend.md §4)
+│   ├── ipc-messages.schema.json # the flipctld<->plugin NDJSON protocol schema (see backend.md §5)
+│   └── go/apitypes/             # oapi-codegen output from openapi.yaml — a shared Go package,
+│                                 # imported directly by both flipctld (backend.md) and tui/
 │
 ├── web/                          # TypeScript / React
 │   ├── apps/web/                 # Vite entry point
 │   └── packages/
-│       ├── core/                 # Navigator, InputAdapter, data-хуки (в т.ч. useRegistry())
+│       ├── core/                 # Navigator, InputAdapter, data hooks (incl. useRegistry())
 │       ├── ui-kit/                # MenuLine, StatusBar, PopupMenu, Dialog, Scrollbar, GenericActionScreen
 │       ├── screens/               # Menu, Wifi, Ethernet, Power, ... (kind: "custom")
-│       └── assets/                # сгенерированные шрифты/иконки/спрайты
+│       └── assets/                # generated fonts/icons/sprites
 │
 ├── tui/                           # Go
 │   ├── go.mod                     # require .../contract/go/apitypes
 │   ├── main.go
-│   ├── navigator.go               # Navigator (tea.Model), стек Screen
+│   ├── navigator.go               # Navigator (tea.Model), the Screen stack
 │   ├── input.go                   # tea.KeyMsg -> InputAction
-│   ├── data/                      # net/http клиенты к backend API, используют apitypes
+│   ├── data/                      # net/http clients to the backend API, using apitypes
 │   ├── widgets/                   # menuLine.go, statusBar.go, popupMenu.go, genericAction.go, ...
 │   └── screens/                   # menu.go, wifi.go, ethernet.go, power.go, ... (kind: "custom")
 │
 └── tools/
-    └── asset-pipeline/            # преемники ttf-to-js.py / png-to-bitmap.py, Web-only
+    └── asset-pipeline/            # successors to ttf-to-js.py / png-to-bitmap.py, Web-only
 ```
 
-`contract/go/apitypes` — не новая сущность, а конкретизация того, что раньше в этом разделе называлось "общим contract" только на словах: реальный Go-пакет, который `tui/go.mod` подключает напрямую как зависимость (через `go.work` или обычный `require` с публикацией/локальным путём), без кодогенерации на границе TUI↔backend — она нужна только между `openapi.yaml` и этим пакетом (один раз), не между TUI и `flipctld`.
+`contract/go/apitypes` isn't a new entity, but the concrete realization of what this section used to call the "shared contract" only in words: a real Go package that `tui/go.mod` pulls in directly as a dependency (via `go.work`, or an ordinary `require` against a published module/local path), with no codegen step at the TUI↔backend boundary — codegen is only needed between `openapi.yaml` and this package (once), not between TUI and `flipctld`.
 
 ---
 
-## 10. Технологический стек
+## 10. Technology stack
 
-| Область | Технология | Обоснование |
+| Area | Technology | Rationale |
 |---|---|---|
-| Web — язык | TypeScript | Типобезопасность поверх `api-contract`. |
-| Web — UI | React + `react-dom` | Явное требование заказчика; зрелая экосистема. |
-| Web — рендеринг | Canvas2D (`PixelSurface`/`CanvasSurface`), без Yoga/WASM | Pixel-perfect требование; форвард-совместимость с будущим DRM-таргетом (раздел 5). |
-| Web — сборка | Vite | Стандарт де-факто для React+TS в 2025-2026, HMR, малый boilerplate. |
-| TUI — язык | Go | Тот же язык, что backend-ядро (`backend.md`) — реальная синергия общих типов контракта вместо ручной синхронизации между языками; компилируемый бинарник, минимальный RSS/старт, никакого резидентного JS-рантайма. |
-| TUI — рендеринг | `bubbletea` + `lipgloss` (+ `bubbles` для готовых компонентов) | Elm-архитектура, зрелая и широко используемая в проде экосистема Charm, не требует GPU/браузерного движка. |
-| TUI — HTTP-клиент | `net/http` (stdlib) | Не нужен сторонний пакет — в отличие от Rust-версии, где выбирали между `ureq`/`reqwest`. |
-| TUI — SSH | системный `sshd` + forced command (по умолчанию); `wish` (Charm) — опция для полностью автономного устройства, с готовой bubbletea-интеграцией | См. раздел 6.5. |
-| Протокол (input-actions, navigation) | Markdown-спецификации, реализованы вручную на TS и Go | Не требует общего рантайма/кодогенерации для PoC-масштаба; дёшево поддерживать вручную при объёме ~11 InputAction. |
-| App Registry | `GET /api/registry` (новый backend-эндпоинт), JSON с полем `kind: "custom" \| "generic"` | Источник правды — backend/плагины, а не UI-репозиторий; см. раздел 4.2. Требует реализации на стороне backend (вне скоупа документа). |
-| Data (Web) | нативный `fetch`/`EventSource`-совместимые обёртки к backend API | Backend полностью переосмыслен (`backend.md`, Go), но контракт путей (`/api/*`) сохраняется — Web-код не меняется. |
+| Web — language | TypeScript | Type safety on top of the `api-contract`. |
+| Web — UI | React + `react-dom` | An explicit requirement from the client; a mature ecosystem. |
+| Web — rendering | Canvas2D (`PixelSurface`/`CanvasSurface`), no Yoga/WASM | The pixel-perfect requirement; forward-compatibility with a future DRM target (section 5). |
+| Web — build | Vite | The de facto standard for React+TS in 2025-2026, HMR, minimal boilerplate. |
+| TUI — language | Go | The same language as the backend core (`backend.md`) — real synergy on shared contract types instead of manual synchronization between languages; a compiled binary, minimal RSS/startup time, no resident JS runtime. |
+| TUI — rendering | `bubbletea` + `lipgloss` (+ `bubbles` for ready-made components) | The Elm architecture, a mature and widely used-in-production Charm ecosystem, no GPU/browser engine required. |
+| TUI — HTTP client | `net/http` (stdlib) | No third-party package needed — unlike the Rust version, where we chose between `ureq`/`reqwest`. |
+| TUI — SSH | The system `sshd` + a forced command (by default); `wish` (Charm) — an option for a fully self-contained device, with ready-made bubbletea integration | See section 6.5. |
+| Protocol (input-actions, navigation) | Markdown specs, implemented by hand in TS and Go | Doesn't require a shared runtime/codegen at PoC scale; cheap to maintain by hand at ~11 InputAction values. |
+| App Registry | `GET /api/registry` (a new backend endpoint), JSON with a `kind: "custom" \| "generic"` field | The source of truth is the backend/plugins, not the UI repository; see section 4.2. Requires implementation on the backend side (out of this document's scope). |
+| Data (Web) | Native `fetch`/`EventSource`-compatible wrappers around the backend API | The backend has been completely rethought (`backend.md`, Go), but the path contract (`/api/*`) is preserved — the Web code doesn't change. |
 
 ---
 
-## 11. Риски и открытые вопросы
+## 11. Risks and open questions
 
-- **Ручная синхронизация протокола.** `input-actions`/`navigation-semantics` поддерживаются вручную в двух местах (TS и Go) — это по-прежнему два разных языка, смена TUI-стека с Rust на Go эту конкретную проблему не убирает (она про Web vs TUI, а не про TUI vs backend). При текущем небольшом размере риск низкий, но стоит завести простой CI-чек (юнит-тест на каждой стороне, сверяющий имена вариантов enum со значением, зашитым в `contract/*.md`), чтобы не полагаться только на дисциплину.
-- **`GET /api/registry` — новый backend-эндпоинт, которого нет в `server.js` сегодня.** Риск в основном снят: эндпоинт полностью специфицирован в `backend.md §7`/§8 (компаньон-документ, не "чёрный ящик" — см. правку шапки выше). Остаётся только фактическая реализация backend-стороны, вне кода этого репозитория, но контракт согласован между документами.
-- **Поведение при недоступности `/api/registry` на старте.** Встраиваемое устройство может поднимать backend и UI не строго последовательно, сеть/локальный сокет может быть временно недоступен. Нужно решить стратегию: ретраи с backoff, кэш последнего успешного ответа (где хранить на TUI-стороне — временный файл?), либо просто пустое меню + баннер ошибки. Не проработано в этом документе.
-- **Версионирование схемы `kind: "generic"`.** Формат `status_fields`/`actions` из раздела 4.2 — по сути мини-DSL. Если он будет расширяться (условная видимость полей, валидация ввода, разные типы action), стоит с самого начала подумать про `schema_version` в ответе `/api/registry`, чтобы не ломать старые клиенты новыми плагинами.
-- **Терминальные ограничения по SSH** (урезанный `TERM`, отсутствие true color над некоторыми сессиями, разный размер терминала) — `lipgloss` умеет деградировать по цвету через `termenv`, но раскладку/резервные стили под "бедный" терминал стоит явно предусмотреть в `widgets/`, а не как afterthought.
-- **`wish` (SSH-сервер в бинарнике)** — не проверялся в этом документе на реальном PoC; если решим использовать вариант B из раздела 6.5, нужно отдельное исследование (resize/`SIGWINCH` через `wish`-сессию, политика аутентификации — сама библиотека не решает, кому разрешён доступ).
-- **Разделение `tui/` и `flipctld` на два Go-модуля с общим `contract/go/apitypes`** (раздел 9) — не проверенная на практике схема линковки (через `go.work` в деве, через что именно в проде — публикация пакета? локальный путь?). Альтернатива — объединить `tui/` и `flipctld` в один Go-модуль/монорепо ради ещё более прямого шаринга — сознательно не выбрана сейчас, чтобы не ломать разделение на два документа/репозитория (frontend.md/backend.md), но остаётся дешёвой опцией, если раздельные модули окажутся неудобны на практике.
+- **Manual protocol synchronization.** `input-actions`/`navigation-semantics` are maintained by hand in two places (TS and Go) — these are still two different languages; switching the TUI stack from Rust to Go doesn't remove this specific problem (it's about Web vs. TUI, not TUI vs. backend). At the current small size the risk is low, but it's worth setting up a simple CI check (a unit test on each side comparing enum variant names against the value baked into `contract/*.md`), rather than relying on discipline alone.
+- **`GET /api/registry` — a new backend endpoint that doesn't exist in `server.js` today.** The risk is largely resolved: the endpoint is fully specified in `backend.md §7`/§8 (a companion document, not a "black box" — see the header fix mentioned above). What's left is only the actual implementation on the backend side, outside this repository's code, but the contract is agreed between the documents.
+- **Behavior when `/api/registry` is unavailable at startup.** An embedded device may bring up the backend and the UI in no particular order, and the network/local socket may be temporarily unavailable. A strategy needs to be decided: retries with backoff, caching the last successful response (where would that be stored on the TUI side — a temp file?), or just an empty menu + an error banner. Not worked out in this document.
+- **Versioning the `kind: "generic"` schema.** The `status_fields`/`actions` format from section 4.2 is essentially a small DSL. If it grows (conditional field visibility, input validation, different action types), it's worth thinking from the start about a `schema_version` in the `/api/registry` response, so new plugins don't break old clients.
+- **Terminal limitations over SSH** (a restricted `TERM`, no true color on some sessions, varying terminal sizes) — `lipgloss` can degrade color via `termenv`, but layout/fallback styles for a "poor" terminal are worth explicitly planning for in `widgets/`, not as an afterthought.
+- **`wish` (an SSH server in the binary)** — not tested in this document against a real PoC; if we decide to use option B from section 6.5, a separate investigation is needed (resize/`SIGWINCH` through a `wish` session, an authentication policy — the library itself doesn't decide who's allowed access).
+- **Splitting `tui/` and `flipctld` into two Go modules with a shared `contract/go/apitypes`** (section 9) — this linking scheme hasn't been proven in practice (via `go.work` in dev — but what exactly in production? Publishing the package? A local path?). The alternative — merging `tui/` and `flipctld` into one Go module/monorepo for even more direct sharing — was deliberately not chosen now, so as not to break the split into two documents/repositories (frontend.md/backend.md), but it remains a cheap option if separate modules prove inconvenient in practice.
 
 ---
 
-## 12. Дорожная карта PoC
+## 12. PoC roadmap
 
-1. `contract/`: зафиксировать `input-actions.md`, `navigation-semantics.md`.
-2. Backend: реализовать минимальный `GET /api/registry`, отдающий 3-4 тестовых приложения с `kind: "custom"` (сам эндпоинт — задача владельца backend-части, вне кода этого репозитория).
-3. Web: `PixelSurface`/`CanvasSurface` + `MenuScreen`, читающий список из `GET /api/registry` — доказать, что рисование через `PixelSurface` совпадает по пикселям с прототипом.
-4. TUI: `Navigator` (`tea.Model`) + интерфейс `Screen` + `MenuScreen` на `bubbletea`, читающий тот же `GET /api/registry` — доказать, что оба таргета реально ведут себя как одна и та же навигация поверх одних и тех же backend-данных.
-5. Подключить оба таргета к 1-2 реальным `kind: "custom"` экранам (Wi-Fi, Ethernet) через backend (`flipctld`, см. `backend.md §13` шаг 4) — доказать, что переход `server.js` → `flipctld` не потребовал изменений в существующих `/api/*` ни для одного из двух рендереров.
-6. Развернуть TUI-бинарник через systemd getty (локальный tty) и через forced-command SSH — проверить оба сценария входа из README.
-7. (Опционально, после PoC) `kind: "generic"`: `GenericActionScreen`/`generic_action.rs` + один реальный CLI-wrapper плагин (например `ping`) — проверить, что новый плагин действительно не требует изменений в UI-коде.
+1. `contract/`: lock down `input-actions.md`, `navigation-semantics.md`.
+2. Backend: implement a minimal `GET /api/registry` serving 3-4 test apps with `kind: "custom"` (the endpoint itself is the responsibility of whoever owns the backend, outside this repository's code).
+3. Web: `PixelSurface`/`CanvasSurface` + a `MenuScreen` reading the list from `GET /api/registry` — prove that drawing via `PixelSurface` matches the prototype pixel for pixel.
+4. TUI: a `Navigator` (`tea.Model`) + a `Screen` interface + a `MenuScreen` on `bubbletea`, reading the same `GET /api/registry` — prove that both targets genuinely behave as the same navigation over the same backend data.
+5. Wire up both targets to 1-2 real `kind: "custom"` screens (Wi-Fi, Ethernet) through the backend (`flipctld`, see `backend.md §13` step 4) — prove that the `server.js` → `flipctld` transition required no changes to the existing `/api/*` for either renderer.
+6. Deploy the TUI binary via systemd getty (a local tty) and via forced-command SSH — verify both entry scenarios from the README.
+7. (Optional, after the PoC) `kind: "generic"`: `GenericActionScreen`/`generic_action.rs` + one real CLI-wrapper plugin (e.g. `ping`) — verify that a new plugin genuinely requires no changes to the UI code.

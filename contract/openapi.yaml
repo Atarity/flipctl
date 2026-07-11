@@ -61,7 +61,7 @@ paths:
         "409":
           description: >
             effect=send_event targeted a plugin with no Running job
-            (backend.md §12 — "send_event в отсутствующий job").
+            (backend.md §12 — "send_event targeting a missing job").
           content:
             application/json:
               schema:

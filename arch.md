@@ -1,127 +1,94 @@
-# FlipCTL — архитектура (сжатая версия)
+# FlipCTL — Architecture (condensed version)
 
-> Полные версии: [`frontend.md`](./frontend.md), [`backend.md`](./backend.md). Этот файл — выжимка для онбординга.
+> Full versions: [`frontend.md`](./frontend.md), [`backend.md`](./backend.md). This file is a condensed summary for onboarding.
 
-**Цель:** удобный доступ к инструментам Linux (сеть, systemd, процессы) через pixel-perfect интерфейс небольшого экрана с огранниченным набором физических кнопок.
+**Goal:** convenient access to Linux tools (networking, systemd, processes) through a pixel-perfect interface on a small screen with a limited set of physical buttons.
 
-## Общая архитектура
+## Overall architecture
+[![FlipCTL arch preview](/assets/260711-FlipCTL-arch-preview.png)](/260711-FlipCTL-arch.pdf)
 
-```mermaid
-flowchart TB
-    WEB["**Web браузер**<br> или локальный Cog/WPE"]
-    TUI["**TUI**<br>Go + bubbletea, локально/SSH"]
-    REMOTE["**Remote HW**"]
+> [PDF version](/260711-FlipCTL-arch.pdf)
 
-    CADDY["**Caddy**<br>статика Web-сборки + reverse proxy /api/*"]
-
-    subgraph CORE["**flipctld** — backend-ядро (Go)"]
-        API["HTTP + SSE API"]
-        REG["Plugin Registry"]
-        JM["Job Manager"]
-        BUS["Event Bus"]
-    end
-
-    subgraph PLUGINS["Плагины — отдельные процессы, любой язык"]
-        SYS["system: wifi, power, ..."]
-        COM["community: ping, nmap, ..."]
-    end
-
-    subgraph OS["Linux (Raspberry Pi 4)"]
-        DBUS["D-Bus: NetworkManager, systemd"]
-        BIN["CLI-утилиты"]
-    end
-
-    WEB --> CADDY -- "HTTP/SSE" --> API
-    REMOTE -- "SSH" --> TUI
-    TUI -- "HTTP/SSE" --> API
-    API --> REG
-    API --> JM
-    JM -- "spawn + NDJSON/stdio" --> PLUGINS
-    PLUGINS -- события --> BUS --> API
-    SYS --> DBUS
-    COM --> BIN
-```
-
-Ключевые идеи:
-- **общий контракт, вместо общего кода.** Frontend (Web и TUI) и backend — три независимых, идиоматичных для своей платформы стека, связанных API/схемами (`contract/`), а не общим рантаймом.
-- **Система пользовательских и ситемных плагинов в лёгкой Go обертке**. Плагины можно писать на любом подходящем языке или использовать готовые механизмы Линукса типа D-bus, libs (libcurl).
-- **Основа GUI выполнена на web технологиях**. Легко разрабатывать, дешево поддерживать.
-- **Web и TUI используют общий API к бекэнду, но не шарят между собой UI логику и ассеты**. Имеют раздельные движки для рендеринга.
-- **Рендеринг на экран устройства осуществляется из headless браузера через Linux DRM**. Нет возни с драйверами, небольшой футпринт памяти. Полноценный веб-интерфейс в качестве бонуса.
+Key ideas:
+- **A shared contract instead of shared code.** Frontend (Web and TUI) and backend are three independent stacks, each idiomatic to its own platform, connected by an API/schemas (`contract/`) rather than a shared runtime.
+- **A system of user and system plugins in a thin Go wrapper.** Plugins can be written in any suitable language, or built on existing Linux mechanisms like D-Bus or libraries (libcurl).
+- **The GUI is built on web technologies.** Easy to develop, cheap to maintain.
+- **Web and TUI share a common backend API, but don't share UI logic or assets between themselves.** Each has its own rendering engine.
+- **Rendering to the device screen is done from a headless browser via Linux DRM.** No fuss with drivers, a small memory footprint. A full-fledged web interface as a bonus.
 
 ## Frontend
 
-- **Web** — React + `react-dom`, рендер в один `<canvas>` (`PixelSurface`/`CanvasSurface`) ради pixel-perfect 1-bit стиля прототипа. Не используем Yoga пытаясь объединить UI с TUI. Вместо этого используем фиксированные пиксельные константы, как в `fake-FlipCTL`.
-- **TUI** — Go + `bubbletea`/`lipgloss`/`bubbles`. Тот же язык, что backend — реальная синергия общих типов (`contract/go/apitypes`). Не pixel-perfect, обычный текстовый UI. Компилируемый бинарник, экономия ресурсов на портативном SBC. SSH — через forced-command системного `sshd` (или `wish` из того же стека `bubbletea`).
-- Общее между Web и TUI:
-  - семантика ввода (`InputAction`: Up/Down/Ok/Back/SoftKey1/...);
-  - модель навигации (стек экранов + отдельный overlay-стек);
-  - реестр приложений — приходит из backend registry manager, не хранится во frontend.
-- Пример **одного элемента** массива, который отдаёт `GET /api/registry` — так backend описывает фронтенду один конкретный плагин (`ping`); реестр целиком — это массив таких объектов, по одному на каждый установленный плагин:
+- **Web** — React + `react-dom`, rendering into a single `<canvas>` (`PixelSurface`/`CanvasSurface`) to preserve the prototype's pixel-perfect 1-bit style. We don't use Yoga to try to unify the UI with the TUI — instead we use fixed pixel constants, as in `fake-FlipCTL`.
+- **TUI** — Go + `bubbletea`/`lipgloss`/`bubbles`. Same language as the backend — real synergy on shared types (`contract/go/apitypes`). Not pixel-perfect, a regular text UI. A compiled binary, saving resources on the portable SBC. SSH — via a forced-command on the system `sshd` (or `wish` from the same `bubbletea` stack).
+- Shared between Web and TUI:
+  - input semantics (`InputAction`: Up/Down/Ok/Back/SoftKey1/...);
+  - the navigation model (a screen stack + a separate overlay stack);
+  - the app registry — comes from the backend's registry manager, not stored in the frontend.
+- Example of **a single element** of the array returned by `GET /api/registry` — this is how the backend describes one specific plugin (`ping`) to the frontend; the full registry is an array of such objects, one per installed plugin:
   ```jsonc
   { "id": "ping", "kind": "generic",
     "inputs": [{ "id": "target", "type": "text" }],
     "actions": [{ "id": "run", "endpoint": "/api/plugins/ping/run", "bind": "slot:2" }] }
   ```
-  - `id` — уникальный идентификатор плагина; из него строятся все остальные пути (`/api/plugins/ping/...`).
-  - `kind: "generic"` — фронтенду не нужно искать написанный вручную экран, плагин рисуется общим компонентом `GenericActionScreen.tsx`/`generic_action.go`. Для сравнения: `kind: "custom"` → написанный вручную экран (Wi-Fi, Ethernet, Power) со своей логикой.
-  - `inputs` — поля, которые пользователь заполняет перед запуском. Здесь одно текстовое поле `target` — на экране появится строка ввода; то, что туда впишут, уйдёт в плагин под тем же ключом `target` (см. IPC-пример ниже — это один и тот же `ping`, просто на следующем шаге).
-  - `actions` — софт-кнопки экрана.
+  - `id` — the plugin's unique identifier; all other paths are built from it (`/api/plugins/ping/...`).
+  - `kind: "generic"` — the frontend doesn't need to look for a hand-written screen; the plugin is drawn by the shared `GenericActionScreen.tsx`/`generic_action.go` component. For comparison: `kind: "custom"` → a hand-written screen (Wi-Fi, Ethernet, Power) with its own logic.
+  - `inputs` — fields the user fills in before launch. Here there's one text field, `target` — a text input will appear on screen; whatever's typed there is passed to the plugin under the same `target` key (see the IPC example below — it's the same `ping`, just at the next step).
+  - `actions` — the screen's soft buttons.
 
 ## Backend
 
-- **`flipctld` (Go)** — тонкий супервизор. Не хранилище бизнес-логики. Заменяет `server.js` из `fake-FlipCTL`. Реализует API в то время, как статику Web-сборки и внешние обращения берёт на себя отдельный `Caddy`. Перед ним (reverse proxy `/api/*`), не сам `flipctld`.
-- **Плагины** — отдельные OS-процессы. Можно использовать любой язык (единственное требование — читать/писать JSON). Подключаютсячерез небольшую обёртку на Go. Упакованы вместе с манифестом, бинарниками, иконками, декларативным описанием UI. Можно делить и классифицировать их по разным параметрам.
+- **`flipctld` (Go)** — a thin supervisor. Not a store of business logic. Replaces `server.js` from `fake-FlipCTL`. It implements the API, while a separate `Caddy` handles the Web build's static files and external requests, sitting in front of it (reverse proxy `/api/*`), not `flipctld` itself.
+- **Plugins** — separate OS processes. Any language can be used (the only requirement is being able to read/write JSON). They're wired in through a small Go wrapper. Packaged together with a manifest, binaries, icons, and a declarative UI description. They can be split and classified along several axes.
 
-  - По уровню доступа `tier`:
-    - `system` (Wi-Fi, power, cron, ...) — обязательный базовый минимум. Написаны и проверены командой Flipper.
-    - `community` (ping, nmapб curl, ...) — пользовательские.
-  - По типу запуска `execution`:
-    - `one-shot` — запустился/отработал/вышел. `whoami`.
-    - `stream` — живёт, шлёт данные и события. `ping`
-    - `daemon`  — живёт независимо от клиентов, большую часть времени чё-то ждёт. Например система уведомлений.
-  - По типу UI `ui_type`:
-    - `custom` — собственный уникальный UI, который представлен настоящими ассетами в `frontend/UI`.
-    - `generic` — использует примитивы из дефолтового UI-kit: list, grid, MenuBar, softKeys, dropDown, ...
+  - By access level (`tier`):
+    - `system` (Wi-Fi, power, cron, ...) — a mandatory baseline. Written and vetted by the Flipper team.
+    - `community` (ping, nmap, curl, ...) — user-contributed.
+  - By execution type (`execution`):
+    - `one-shot` — starts, does its work, exits. `whoami`.
+    - `stream` — stays alive, sends data and events. `ping`
+    - `daemon` — lives independently of clients, mostly idle, waiting for something. E.g. a notification system.
+  - By UI type (`ui_type`):
+    - `custom` — its own unique UI, backed by real assets in `frontend/UI`.
+    - `generic` — uses primitives from the default UI kit: list, grid, MenuBar, softKeys, dropDown, ...
 
-- **IPC** — отдельный протокол между `flipctld` и конкретным запущенным процессом плагина; инициализируется сразу после того, как пользователь нажал кнопку из примера выше. NDJSON = по одному JSON-объекту на строку — самый простой формат, не требует библиотек ни на одном языке:
+- **IPC** — a separate protocol between `flipctld` and a specific running plugin process; kicked off right after the user presses the button from the example above. NDJSON = one JSON object per line — the simplest possible format, needs no library in any language:
   ```json
   {"type":"start","inputs":{"target":"8.8.8.8"}}
   {"type":"output","fields":{"status":"reachable","rtt_ms":13.2}}
   {"type":"done","exit_code":0}
   ```
-  - Строка 2 — плагин пишет в свой **stdout**: вызвал системный `ping`, распарсил его вывод сам и отдал уже структурированный результат (`status`, `rtt_ms` — поля, объявленные в манифесте плагина как `outputs`). `flipctld` принимает эту строку и рассылает её всем клиентам, подписанным на этот job, через SSE — в том числе тем, кто job не запускал.
+  - Line 2 — the plugin writes to its own **stdout**: it called the system `ping`, parsed its output itself, and handed back an already-structured result (`status`, `rtt_ms` — fields declared in the plugin's manifest as `outputs`). `flipctld` picks up this line and broadcasts it to every client subscribed to this job over SSE — including clients that didn't start the job themselves.
 
-- **Job / Session / Event Bus** — job общий для всех клиентов с самого начала: кто угодно может подписаться на уже бегущий job через SSE (Web и TUI видят один и тот же живой поток одновременно). Состояний больше, чем "работает/не работает" — важно различать, на каком именно этапе всё пошло не так:
+- **Job / Session / Event Bus** — a job is shared across all clients from the start: anyone can subscribe to an already-running job over SSE (Web and TUI see the same live stream at the same time). There are more states than just "running/not running" — it matters exactly at which stage something went wrong:
 
   ```mermaid
   stateDiagram-v2
       [*] --> Pending: POST /api/plugins/{id}/{action}
-      Pending --> Running: процесс заспавнен, получено "ready"
-      Pending --> Failed: не удалось запустить процесс
+      Pending --> Running: process spawned, got "ready"
+      Pending --> Failed: failed to start the process
       Running --> Completed: "done", exit_code=0
-      Running --> Failed: "error" или exit_code != 0
+      Running --> Failed: "error" or exit_code != 0
       Running --> Stopped: stop_job (SIGTERM)
       Completed --> [*]
       Failed --> [*]
       Stopped --> [*]
   ```
 
-- **Button input в плагинах**: у action в манифесте есть `bind` (`slot:0..4` — позиция в панели экрана, либо `input:back` — универсальное действие) и раздельные `on_press`/`on_release` с эффектом `start_job | stop_job | send_event`. `send_event` шлёт именованное событие в stdin уже бегущего процесса, не спавнит новый.
-- **System-плагины могут (и должны) использовать D-Bus** (NetworkManager/systemd напрямую) вместо простого парсинга вывода CLI через regex.
-- **Привилегии (временно отложены)**: пока все плагины равнодоверенные. Кандидат на будущее — D-Bus policy + **polkit**, тот же стек, что использует сам NetworkManager; работает только если у каждого плагина свой D-Bus-identity (плагин сам держит клиента, не `flipctld` от его имени).
+- **Button input in plugins**: an action in the manifest has a `bind` (`slot:0..4` — a position on the screen's button panel, or `input:back` — a universal action) and separate `on_press`/`on_release` handlers with an effect of `start_job | stop_job | send_event`. `send_event` sends a named event to the stdin of an already-running process instead of spawning a new one.
+- **System plugins can (and should) use D-Bus** (talking to NetworkManager/systemd directly) instead of just parsing CLI output with regex.
+- **Privileges (deferred for now)**: all plugins are currently equally trusted. A future candidate is D-Bus policy + **polkit**, the same stack NetworkManager itself uses; it only works if each plugin has its own D-Bus identity (the plugin holds its own client, rather than `flipctld` acting on its behalf).
 
-## Контракт
-- `contract/openapi.yaml` — HTTP/SSE API (`/api/registry`, `/api/plugins/{id}/{action}`, `/api/jobs/*`).
-- `contract/manifest.schema.json` — JSON Schema манифеста плагина.
-- `contract/ipc-messages.schema.json` — схема NDJSON-сообщений `flipctld` ↔ плагин.
-- Формализовано, чтобы риск ручной рассинхронизации типов закрывался кодогенерацией: backend и TUI (оба на Go) используют один сгенерированный пакет `contract/go/apitypes` напрямую, Web (TypeScript) — отдельно генерирует TS-типы из той же схемы.
+## Contract
+- `contract/openapi.yaml` — the HTTP/SSE API (`/api/registry`, `/api/plugins/{id}/{action}`, `/api/jobs/*`).
+- `contract/manifest.schema.json` — the JSON Schema for a plugin manifest.
+- `contract/ipc-messages.schema.json` — the schema for NDJSON messages between `flipctld` and a plugin.
+- Formalized so the risk of manual type drift is closed by codegen: the backend and TUI (both in Go) use one generated `contract/go/apitypes` package directly; Web (TypeScript) separately generates TS types from the same schema.
 
 ## Notes
-- Был вариант сначала рисовать TUI и потом из него генерировать web — отброшен т.к. не добиться pixel perfect картинки на экране (в TUI мы оперируем вертикальной ячейкой, а не квадратным пикселем), а так же тянет за собой nodejs и WASM.
-- Я бы наметил critical path и сделал быстрый прототип для проверки гипотез этой архитектуры. В нём бы вовсе не было ветки с TUI.
-- Нужно менять или дорабатывать (или просто глубже ресёрчить) COG т.к. сейчас есть проблемы с его запуском в чистом DRM на реальном железе.
-- Backend = **Go** (`bubbletea`) специально ради синергии — backend и TUI используют общий сгенерированный пакет типов напрямую. Bubbletea и вся его экосистема — старый, хорошо опробованный проект.
-- Sandboxing плагинов — отложен.
-- Система прав плагинов — отложено.
-- Caddy как отдельный процесс выбран сознательно ради низкого порога входа и независимого релиза Web-фронтенда — цена: второй резидентный процесс на SBC.
+- There was an option to draw the TUI first and generate the web UI from it — dropped because you can't get a pixel-perfect screen that way (in a TUI we're working with a tall terminal cell, not a square pixel), and it also drags in Node.js and WASM.
+- I'd sketch out the **critical path** and build a quick prototype to test this architecture's assumptions. **It wouldn't have a TUI branch of the architecture diagram at all**.
+- **COG/WPE needs to be replaced**, improved, or at least researched more deeply — right now there are real problems getting it running in pure DRM mode on actual hardware.
+- **Backend** = Golang partly for the synergy (TUI frontend is `bubbletea`) — the backend and TUI use a shared generated type package directly. Bubbletea and its whole ecosystem is an old, well-proven project.
+- **Plugin sandboxing** — deferred.
+- **Plugin permissions system** — deferred.
+- **Caddy** as a separate process was chosen deliberately for a low barrier to entry and an independent release cycle for the Web frontend — the cost: a second resident process on the SBC.
